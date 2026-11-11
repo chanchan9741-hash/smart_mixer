@@ -102,6 +102,8 @@ public:
     void set_file_open_callback(FileOpenCallback cb) { m_file_open_callback = cb; }
     void set_file_export_callback(FileExportCallback cb) { m_file_export_callback = cb; }
     void set_ai_separate_callback(AISeparateCallback cb) { m_ai_separate_callback = cb; }
+    void set_ai_busy(bool busy) { m_is_ai_busy = busy; }
+    bool is_ai_busy() const { return m_is_ai_busy.load(); }
     int get_dragging_fader() const { return m_dragging_fader; }
 
     void open_file_dialog() {
@@ -247,6 +249,7 @@ private:
     FileOpenCallback m_file_open_callback;
     FileExportCallback m_file_export_callback;
     AISeparateCallback m_ai_separate_callback;
+    std::atomic<bool> m_is_ai_busy{false};
     std::wstring m_active_device_name;
     std::wstring m_active_output_name;
 
@@ -471,6 +474,10 @@ private:
 
             // ▶ 재생 / ⏸ 일시정지 (x: 874 ~ 948, y: 492 ~ 514)
             if (x >= 874 && x <= 948 && y >= 492 && y <= 514) {
+                if (m_is_ai_busy.load()) {
+                    show_toast("AI 스템 분리가 진행 중입니다. 잠시만 기다려주세요...", 2.5f);
+                    return;
+                }
                 if (m_file_player.is_playing()) {
                     m_file_player.pause();
                 } else {
@@ -487,6 +494,10 @@ private:
 
             // 🤖 Demucs AI 스템 분리 (x: 874 ~ 1030, y: 518 ~ 542)
             if (x >= 874 && x <= 1030 && y >= 518 && y <= 542) {
+                if (m_is_ai_busy.load()) {
+                    show_toast("AI 스템 분리가 이미 진행 중입니다. 잠시만 기다려주세요...", 2.5f);
+                    return;
+                }
                 if (m_ai_separate_callback) {
                     m_ai_separate_callback();
                 }
@@ -968,11 +979,27 @@ private:
             // 🤖 Demucs AI 스템 분리 버튼
             RECT aiBtnRc = { 874, 518, 1030, 542 };
             bool has_ai = m_file_player.has_ai_stems();
-            HBRUSH aiBr = CreateSolidBrush(has_ai ? RGB(16, 75, 45) : RGB(64, 38, 96));
-            FillRect(hdc, &aiBtnRc, aiBr);
-            DeleteObject(aiBr);
-            SetTextColor(hdc, has_ai ? RGB(57, 255, 20) : RGB(220, 180, 255));
-            DrawTextW(hdc, has_ai ? L"✨ AI 스템 활성화됨 (Demucs)" : L"🤖 Demucs AI 스템 분리", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            bool is_busy = m_is_ai_busy.load();
+
+            if (is_busy) {
+                HBRUSH aiBr = CreateSolidBrush(RGB(90, 70, 15));
+                FillRect(hdc, &aiBtnRc, aiBr);
+                DeleteObject(aiBr);
+                SetTextColor(hdc, RGB(255, 220, 50));
+                DrawTextW(hdc, L"⏳ AI 스템 분리 중...", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else if (has_ai) {
+                HBRUSH aiBr = CreateSolidBrush(RGB(16, 75, 45));
+                FillRect(hdc, &aiBtnRc, aiBr);
+                DeleteObject(aiBr);
+                SetTextColor(hdc, RGB(57, 255, 20));
+                DrawTextW(hdc, L"✨ AI 스템 활성화됨 (Demucs)", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                HBRUSH aiBr = CreateSolidBrush(RGB(64, 38, 96));
+                FillRect(hdc, &aiBtnRc, aiBr);
+                DeleteObject(aiBr);
+                SetTextColor(hdc, RGB(220, 180, 255));
+                DrawTextW(hdc, L"🤖 Demucs AI 분리 실행", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
 
             // 💾 3-Way 스템 파일 분리 저장 버튼
             RECT expBtnRc = { 874, 546, 1030, 570 };
@@ -984,8 +1011,16 @@ private:
 
             // 가이드 텍스트
             RECT guideRc = { 874, 574, 1030, 598 };
-            SetTextColor(hdc, has_ai ? RGB(57, 255, 20) : RGB(0, 210, 255));
-            DrawTextW(hdc, has_ai ? L"Demucs AI: CH1보컬 CH2비트 CH4악기" : L"STFT 실시간: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+            if (is_busy) {
+                SetTextColor(hdc, RGB(255, 200, 50));
+                DrawTextW(hdc, L"AI 분리 중... (완료 시 자동 재생)", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+            } else if (has_ai) {
+                SetTextColor(hdc, RGB(57, 255, 20));
+                DrawTextW(hdc, L"Demucs AI: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+            } else {
+                SetTextColor(hdc, RGB(0, 210, 255));
+                DrawTextW(hdc, L"STFT 실시간: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+            }
 
         } else {
             RECT stemTxtRc = { 874, 470, 1030, 595 };

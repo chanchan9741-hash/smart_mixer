@@ -143,7 +143,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         std::thread([&]() {
             is_demucs_running.store(true);
-            gui_window.show_toast("🤖 Demucs AI 분리 시작... (약 10~15초 소요, 음악 재생은 유지됩니다)", 10.0f);
+            gui_window.set_ai_busy(true);
+            file_player.pause(); // 분리 완료될 때까지 재생 일시정지 (대기)
+
+            gui_window.show_toast("⏳ Demucs AI 스템 분리 중... (약 10초 대기 후 00:00부터 재생)", 12.0f);
 
             std::wstring in_path = file_player.get_file_path();
             size_t slash = in_path.find_last_of(L"\\/");
@@ -197,6 +200,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
             }
 
+            gui_window.set_ai_busy(false);
+            is_demucs_running.store(false);
+
             if (success) {
                 std::wstring v_path = out_dir + L"\\" + base_name + L"_vocal.wav";
                 std::wstring b_path = out_dir + L"\\" + base_name + L"_beat.wav";
@@ -204,22 +210,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                 bool loaded = file_player.load_ai_stems(v_path, b_path, i_path);
                 if (loaded) {
-                    gui_window.show_toast("🎉 Demucs AI 스템 분리 완료! 스튜디오급 음원으로 자동 전환되었습니다.", 5.0f);
+                    file_player.seek(0.0f); // 00:00부터
+                    file_player.play();     // 완벽 분리된 스튜디오 음원으로 재생 시작!
+                    gui_window.show_toast("🎉 Demucs AI 스템 분리 완료! 스튜디오 음원으로 재생을 시작합니다.", 5.0f);
                 } else {
                     gui_window.show_toast("❌ AI 스템 파일 로드 실패 (파일 손상 또는 미생성)", 4.0f);
                 }
             } else {
                 gui_window.show_toast("❌ Demucs 실행 실패. Python 환경 및 demucs 패키지를 확인하세요.", 5.0f);
             }
-
-            is_demucs_running.store(false);
         }).detach();
     };
 
     gui_window.set_file_open_callback([&](const std::wstring& path) {
         bool ok = file_player.load_file(path);
         if (ok) {
-            file_player.play();
             use_audio_file.store(true);
             gui_window.refresh_devices_with_file();
 
@@ -252,9 +257,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
 
             if (loaded_ai) {
-                gui_window.show_toast("기존 AI 분리 스템이 발견되어 자동 로드되었습니다! (Demucs)", 4.0f);
+                gui_window.show_toast("기존 AI 분리 스템이 발견되어 즉시 재생을 시작합니다! (Demucs)", 4.0f);
+                file_player.play();
             } else {
-                gui_window.show_toast("음원 재생 시작! 백그라운드 Demucs AI 분리가 자동 실행됩니다...", 4.0f);
+                // 즉시 재생하지 않고 대기: AI 스템 분리 완료 후 00:00부터 완벽 분리 재생
+                file_player.pause();
+                gui_window.show_toast("⏳ Demucs AI 스템 분리 중... (약 10초 대기 후 재생)", 12.0f);
                 trigger_demucs_separation();
             }
         } else {
