@@ -31,16 +31,20 @@
 #include "controller_mapper.hpp"
 #include "ui_renderer.hpp"
 #include "wasapi_capture.hpp"
+#include "wasapi_render.hpp"
 #include "audio_file_player.hpp"
 
 namespace SmartMixer {
 
 class MixerGUIWindow {
 public:
-    static constexpr int IDC_DEVICE_COMBO = 1001;
+    static constexpr int IDC_INPUT_COMBO = 1001;
+    static constexpr int IDC_OUTPUT_COMBO = 1002;
+    static constexpr int IDC_DEVICE_COMBO = IDC_INPUT_COMBO;
 
     using ActionCallback = std::function<void()>;
     using DeviceSelectCallback = std::function<void(int)>;
+    using OutputSelectCallback = std::function<void(int)>;
     using FaderCallback = std::function<void(int ch, float norm)>;
     using FaderEndCallback = std::function<void(int ch)>;
     using FileOpenCallback = std::function<void(const std::wstring&)>;
@@ -54,10 +58,12 @@ public:
                    ParameterManager& param_mgr,
                    SpectrumRenderer& spectrum,
                    WasapiCaptureEngine& wasapi,
-                   AudioFilePlayer& file_player)
+                   AudioFilePlayer& file_player,
+                   WasapiRenderEngine& wasapi_render)
         : m_hInstance(hInstance),
           m_hWnd(nullptr),
-          m_hCombo(nullptr),
+          m_hComboInput(nullptr),
+          m_hComboOutput(nullptr),
           m_mixer(mixer),
           m_afs(afs),
           m_loudness(loudness),
@@ -66,16 +72,19 @@ public:
           m_spectrum(spectrum),
           m_wasapi(wasapi),
           m_file_player(file_player),
+          m_wasapi_render(wasapi_render),
           m_dragging_fader(-1),
           m_dragging_target(false),
           m_inject_howling_callback(nullptr),
           m_reset_filters_callback(nullptr),
           m_device_selected_callback(nullptr),
+          m_output_selected_callback(nullptr),
           m_fader_changed_callback(nullptr),
           m_fader_drag_end_callback(nullptr),
           m_file_open_callback(nullptr),
           m_file_export_callback(nullptr),
-          m_active_device_name(L"Virtual Audio Generator") {
+          m_active_device_name(L"Virtual Audio Generator"),
+          m_active_output_name(L"Default Output") {
         
         m_mute_states.resize(5, false);
         m_vu_levels.resize(5, 0.0f);
@@ -85,6 +94,7 @@ public:
     void set_inject_howling_callback(ActionCallback cb) { m_inject_howling_callback = cb; }
     void set_reset_filters_callback(ActionCallback cb) { m_reset_filters_callback = cb; }
     void set_device_selected_callback(DeviceSelectCallback cb) { m_device_selected_callback = cb; }
+    void set_output_selected_callback(OutputSelectCallback cb) { m_output_selected_callback = cb; }
     void set_fader_changed_callback(FaderCallback cb) { m_fader_changed_callback = cb; }
     void set_fader_drag_end_callback(FaderEndCallback cb) { m_fader_drag_end_callback = cb; }
     void set_file_open_callback(FileOpenCallback cb) { m_file_open_callback = cb; }
@@ -155,15 +165,28 @@ public:
 
         if (!m_hWnd) return false;
 
-        // 오디오 입력 장치 선택 콤보박스 생성 (x: 430, y: 12, w: 460, h: 220)
-        m_hCombo = CreateWindowExW(
+        // 오디오 입력 장치 선택 콤보박스 생성 (x: 255, y: 12, w: 285, h: 260)
+        m_hComboInput = CreateWindowExW(
             0,
             L"COMBOBOX",
             L"",
             CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
-            430, 12, 460, 260,
+            255, 12, 285, 260,
             m_hWnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DEVICE_COMBO)),
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_INPUT_COMBO)),
+            m_hInstance,
+            nullptr
+        );
+
+        // 오디오 출력 장치 선택 콤보박스 생성 (x: 615, y: 12, w: 305, h: 260)
+        m_hComboOutput = CreateWindowExW(
+            0,
+            L"COMBOBOX",
+            L"",
+            CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
+            615, 12, 305, 260,
+            m_hWnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_OUTPUT_COMBO)),
             m_hInstance,
             nullptr
         );
@@ -171,9 +194,10 @@ public:
         HFONT hComboFont = CreateFontW(14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                        DEFAULT_PITCH, L"Segoe UI");
-        SendMessageW(m_hCombo, WM_SETFONT, reinterpret_cast<WPARAM>(hComboFont), TRUE);
+        SendMessageW(m_hComboInput, WM_SETFONT, reinterpret_cast<WPARAM>(hComboFont), TRUE);
+        SendMessageW(m_hComboOutput, WM_SETFONT, reinterpret_cast<WPARAM>(hComboFont), TRUE);
 
-        // 입력 장치 목록 추가
+        // 입력 및 출력 장치 목록 추가
         populate_audio_devices();
 
         // 60 FPS 렌더링 타이머 (16ms)
@@ -188,7 +212,8 @@ private:
 
     HINSTANCE m_hInstance;
     HWND m_hWnd;
-    HWND m_hCombo;
+    HWND m_hComboInput;
+    HWND m_hComboOutput;
 
     AudioMixer& m_mixer;
     AutomaticFeedbackSuppression& m_afs;
@@ -198,6 +223,7 @@ private:
     SpectrumRenderer& m_spectrum;
     WasapiCaptureEngine& m_wasapi;
     AudioFilePlayer& m_file_player;
+    WasapiRenderEngine& m_wasapi_render;
 
     std::vector<bool> m_mute_states;
     std::vector<float> m_vu_levels;
@@ -212,34 +238,70 @@ private:
     ActionCallback m_inject_howling_callback;
     ActionCallback m_reset_filters_callback;
     DeviceSelectCallback m_device_selected_callback;
+    OutputSelectCallback m_output_selected_callback;
     FaderCallback m_fader_changed_callback;
     FaderEndCallback m_fader_drag_end_callback;
     FileOpenCallback m_file_open_callback;
     FileExportCallback m_file_export_callback;
     std::wstring m_active_device_name;
+    std::wstring m_active_output_name;
 
     void populate_audio_devices() {
-        if (!m_hCombo) return;
+        populate_input_devices();
+        populate_output_devices();
+    }
 
-        SendMessageW(m_hCombo, CB_RESETCONTENT, 0, 0);
+    void populate_input_devices() {
+        if (!m_hComboInput) return;
+
+        SendMessageW(m_hComboInput, CB_RESETCONTENT, 0, 0);
 
         // 0번: 가상 오디오 신호 생성기
-        SendMessageW(m_hCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"💻 [가상 신호] Virtual Generator (440Hz + Bass Harmonic)"));
+        SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"💻 [가상 신호] Virtual Generator"));
 
         // 1번 ~ N번: 실제 감지된 WASAPI 입력 장치들
         auto devices = m_wasapi.enumerate_capture_devices();
         for (const auto& dev : devices) {
-            std::wstring item_label = L"🎤 [마이크] " + dev.name_wide;
-            SendMessageW(m_hCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str()));
+            std::wstring item_label = L"🎤 " + dev.name_wide;
+            SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str()));
         }
 
         // 음원 파일이 로드되어 있는 경우 파일 재생 옵션 추가
         if (m_file_player.is_loaded()) {
-            std::wstring item_label = L"🎵 [음원 파일] " + m_file_player.get_file_name();
-            int idx = static_cast<int>(SendMessageW(m_hCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str())));
-            SendMessageW(m_hCombo, CB_SETCURSEL, idx, 0);
+            std::wstring item_label = L"🎵 [음원] " + m_file_player.get_file_name();
+            int idx = static_cast<int>(SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str())));
+            SendMessageW(m_hComboInput, CB_SETCURSEL, idx, 0);
         } else {
-            SendMessageW(m_hCombo, CB_SETCURSEL, 0, 0);
+            SendMessageW(m_hComboInput, CB_SETCURSEL, 0, 0);
+        }
+    }
+
+    void populate_output_devices() {
+        if (!m_hComboOutput) return;
+
+        SendMessageW(m_hComboOutput, CB_RESETCONTENT, 0, 0);
+
+        // 0번: 음소거 (출력 안 함)
+        SendMessageW(m_hComboOutput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"🔇 [음소거] 출력 안 함 (Mute)"));
+
+        // 1번 ~ M번: 실제 감지된 WASAPI 출력 장치들
+        auto devices = m_wasapi_render.enumerate_render_devices();
+        int default_sel = 0;
+        for (size_t i = 0; i < devices.size(); ++i) {
+            std::wstring item_label = L"🔊 " + devices[i].name_wide;
+            if (devices[i].is_default) {
+                item_label += L" (기본값)";
+                default_sel = static_cast<int>(i + 1);
+                m_active_output_name = devices[i].name_wide;
+            }
+            SendMessageW(m_hComboOutput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str()));
+        }
+
+        if (devices.empty()) {
+            SendMessageW(m_hComboOutput, CB_SETCURSEL, 0, 0);
+            m_active_output_name = L"None";
+        } else {
+            SendMessageW(m_hComboOutput, CB_SETCURSEL, default_sel, 0);
         }
     }
 
@@ -263,14 +325,25 @@ private:
     LRESULT handle_message(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (msg) {
             case WM_COMMAND: {
-                if (LOWORD(wParam) == IDC_DEVICE_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
-                    int sel = static_cast<int>(SendMessageW(m_hCombo, CB_GETCURSEL, 0, 0));
+                if (LOWORD(wParam) == IDC_INPUT_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                    int sel = static_cast<int>(SendMessageW(m_hComboInput, CB_GETCURSEL, 0, 0));
                     wchar_t selText[256] = {0};
-                    SendMessageW(m_hCombo, CB_GETLBTEXT, sel, reinterpret_cast<LPARAM>(selText));
+                    SendMessageW(m_hComboInput, CB_GETLBTEXT, sel, reinterpret_cast<LPARAM>(selText));
                     m_active_device_name = selText;
 
                     if (m_device_selected_callback) {
                         m_device_selected_callback(sel);
+                    }
+                    return 0;
+                }
+                if (LOWORD(wParam) == IDC_OUTPUT_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                    int sel = static_cast<int>(SendMessageW(m_hComboOutput, CB_GETCURSEL, 0, 0));
+                    wchar_t selText[256] = {0};
+                    SendMessageW(m_hComboOutput, CB_GETLBTEXT, sel, reinterpret_cast<LPARAM>(selText));
+                    m_active_output_name = selText;
+
+                    if (m_output_selected_callback) {
+                        m_output_selected_callback(sel);
                     }
                     return 0;
                 }
@@ -510,25 +583,29 @@ private:
         MoveToEx(hdc, 0, 53, nullptr);
         LineTo(hdc, w, 53);
 
-        HFONT hTitleFont = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        HFONT hTitleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                        DEFAULT_PITCH, L"Segoe UI");
         HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, hTitleFont));
 
         SetTextColor(hdc, RGB(245, 246, 248));
-        TextOutW(hdc, 20, 14, L"🎛️ SMART AUDIO MIXER", 21);
+        TextOutW(hdc, 16, 16, L"🎛️ SMART MIXER", 15);
 
-        // 입력 장치 레이블
+        // 입력 / 출력 장치 레이블
         HFONT hLabelFont = CreateFontW(13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                        DEFAULT_PITCH, L"Segoe UI");
         SelectObject(hdc, hLabelFont);
+
         SetTextColor(hdc, RGB(0, 210, 255));
-        TextOutW(hdc, 265, 17, L"입력 장치 (Input Source):", 20);
+        TextOutW(hdc, 192, 17, L"🎤 입력:", 5);
+
+        SetTextColor(hdc, RGB(57, 255, 20));
+        TextOutW(hdc, 552, 17, L"🔊 출력:", 5);
 
         // FPS 수치
-        SetTextColor(hdc, RGB(57, 255, 20));
-        TextOutW(hdc, w - 145, 17, L"60 FPS (PR-3)", 13);
+        SetTextColor(hdc, RGB(160, 165, 175));
+        TextOutW(hdc, w - 125, 17, L"60 FPS (PR-3)", 13);
 
         SelectObject(hdc, oldFont);
         SelectObject(hdc, oldPen);
@@ -962,7 +1039,12 @@ private:
         HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, hFont));
 
         SetTextColor(hdc, RGB(160, 165, 175));
-        std::wstring statusStr = L"Active Source: " + m_active_device_name + L"  |  Latency < 12ms (PR-1 OK)";
+        std::wstring in_short = m_active_device_name;
+        if (in_short.length() > 28) in_short = in_short.substr(0, 26) + L"..";
+        std::wstring out_short = m_active_output_name;
+        if (out_short.length() > 28) out_short = out_short.substr(0, 26) + L"..";
+
+        std::wstring statusStr = L"🎤 In: " + in_short + L"  |  🔊 Out: " + out_short + L"  |  Latency < 12ms (PR-1)";
         TextOutW(hdc, 20, h - 25, statusStr.c_str(), static_cast<int>(statusStr.length()));
         TextOutW(hdc, w - 210, h - 25, L"Design Spec: S-FR-1 ~ 7 (Pass)", 30);
 

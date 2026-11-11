@@ -24,6 +24,7 @@
 #include "../include/controller_mapper.hpp"
 #include "../include/ui_renderer.hpp"
 #include "../include/wasapi_capture.hpp"
+#include "../include/wasapi_render.hpp"
 #include "../include/audio_file_player.hpp"
 #include "../include/hardware_ipc.hpp"
 #include "../include/gui_window.hpp"
@@ -43,6 +44,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LoudnessMatcher loudness(config.audio.sample_rate, config.loudness);
     SpectrumRenderer spectrum(16, config.afs.fft_size, config.audio.sample_rate);
     WasapiCaptureEngine wasapi;
+    WasapiRenderEngine wasapi_render;
     AudioFilePlayer file_player(config.audio.sample_rate);
 
     // 2. 하드웨어 IPC 소켓 바인딩 (포트: 9123)
@@ -69,7 +71,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     );
 
     // 4. GUI 윈도우 생성
-    MixerGUIWindow gui_window(hInstance, mixer, *afs, loudness, stem_separator, param_mgr, spectrum, wasapi, file_player);
+    MixerGUIWindow gui_window(hInstance, mixer, *afs, loudness, stem_separator, param_mgr, spectrum, wasapi, file_player, wasapi_render);
     pWindow = &gui_window;
 
     // 하울링 강제 주입 및 필터 리셋 콜백
@@ -190,6 +192,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
     });
+
+    // 7. 출력 장치 전환 핸들러 (WASAPI 실시간 스피커 / 이어폰 / DAC 재생)
+    gui_window.set_output_selected_callback([&](int sel) {
+        if (sel == 0) {
+            wasapi_render.stop();
+            gui_window.show_toast("Audio Output Muted (No Sound Output)", 2.0f);
+        } else {
+            int dev_idx = sel - 1;
+            bool ok = wasapi_render.start_device(dev_idx);
+            if (ok) {
+                auto devs = wasapi_render.enumerate_render_devices();
+                std::string name = (dev_idx >= 0 && dev_idx < static_cast<int>(devs.size())) ? devs[dev_idx].name_utf8 : "Selected Speaker";
+                gui_window.show_toast("Speaker Connected: " + name, 3.0f);
+            } else {
+                gui_window.show_toast("Failed to open audio output device!", 3.0f);
+            }
+        }
+    });
+
+    // 기본 오디오 출력 장치 자동 연결
+    wasapi_render.start_device(-1);
 
     if (!gui_window.create(1060, 690)) {
         MessageBoxW(nullptr, L"Failed to create GUI Window!", L"Error", MB_ICONERROR);
@@ -351,6 +374,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             // --- F. 라우드니스 매치 & 피크 리미터 (S-FR-5) ---
             loudness.process(mixed_out.data(), block_size);
 
+            // --- F-2. 실시간 오디오 스피커 출력 (WASAPI Render) ---
+            wasapi_render.write_samples(mixed_out.data(), block_size);
+
             // --- G. 16밴드 스펙트럼 계산 및 GUI 전달 (S-FR-6, PR-3) ---
             auto bars = spectrum.compute_bars(mixed_out.data(), block_size);
             gui_window.update_audio_data(bars, vu_levels);
@@ -384,6 +410,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // 8. 종료 시 정리
     is_running.store(false);
     wasapi.stop();
+    wasapi_render.stop();
     mixer_ipc.close();
     if (audio_thread.joinable()) {
         audio_thread.join();
