@@ -39,13 +39,13 @@ public:
         }
 
         size_t first_chunk = std::min(num_samples, m_capacity - m_write_idx);
-        std::copy(data, data + first_chunk * m_channels, &m_buffer[m_write_idx * m_channels]);
+        std::copy(data, data + first_chunk * m_channels, m_buffer.data() + m_write_idx * m_channels);
 
         size_t second_chunk = num_samples - first_chunk;
         if (second_chunk > 0) {
             std::copy(data + first_chunk * m_channels,
                       data + num_samples * m_channels,
-                      &m_buffer[0]);
+                      m_buffer.data());
         }
 
         m_write_idx = (m_write_idx + num_samples) % m_capacity;
@@ -67,14 +67,14 @@ public:
 
         if (read_samples > 0) {
             size_t first_chunk = std::min(read_samples, m_capacity - m_read_idx);
-            std::copy(&m_buffer[m_read_idx * m_channels],
-                      &m_buffer[(m_read_idx + first_chunk) * m_channels],
+            std::copy(m_buffer.data() + m_read_idx * m_channels,
+                      m_buffer.data() + (m_read_idx + first_chunk) * m_channels,
                       out_data);
 
             size_t second_chunk = read_samples - first_chunk;
             if (second_chunk > 0) {
-                std::copy(&m_buffer[0],
-                          &m_buffer[second_chunk * m_channels],
+                std::copy(m_buffer.data(),
+                          m_buffer.data() + second_chunk * m_channels,
                           out_data + first_chunk * m_channels);
             }
 

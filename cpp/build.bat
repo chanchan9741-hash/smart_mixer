@@ -4,7 +4,7 @@ echo  Building Smart Audio Mixer and HW Simulator
 echo ==============================================
 
 echo [1/4] Compiling Main GUI Application (smart_mixer_gui.exe)...
-g++ -std=c++17 -O3 -mwindows -Iinclude src/gui_main.cpp -lgdi32 -lcomctl32 -lcomdlg32 -lmsimg32 -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid -o smart_mixer_gui.exe
+g++ -std=c++17 -O3 -mwindows -Iinclude src/gui_main.cpp -lgdi32 -lcomctl32 -lcomdlg32 -lmsimg32 -lole32 -lws2_32 -lwinmm -lmfplat -lmfreadwrite -lmfuuid -o smart_mixer_gui.exe
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Failed to compile smart_mixer_gui.exe
     exit /b %ERRORLEVEL%

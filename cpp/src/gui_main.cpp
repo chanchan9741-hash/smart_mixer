@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -35,6 +36,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+    // 고해상도 타이머 활성화 (1ms 주기) - 윈도우 스케줄링 오디오 지연 및 지터 방지
+    timeBeginPeriod(1);
 
     // 1. 코어 DSP 및 설정 초기화
     SystemConfig config;
@@ -222,6 +226,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // 6. 백그라운드 실시간 오디오 DSP & 하드웨어 IPC 스레드 가동
     std::atomic<bool> is_running(true);
     std::thread audio_thread([&]() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
         size_t block_size = config.audio.block_size;
         int sample_rate = config.audio.sample_rate;
         float dt = 1.0f / sample_rate;
@@ -237,13 +243,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         std::vector<float> mixed_out(block_size * 2);
         std::vector<float> vu_levels(5, 0.0f);
 
-        auto block_duration = std::chrono::microseconds(static_cast<int>(block_size * 1000000.0 / sample_rate));
         uint8_t ipc_rx_buf[8192];
         FeedbackPacket fb_pkt;
         fb_pkt.packet_type = PKT_TYPE_FEEDBACK;
 
         while (is_running) {
-            auto start_tp = std::chrono::steady_clock::now();
+            // --- 버퍼 수위 조절 (Adaptive Flow Control) ---
+            if (use_real_mic.load()) {
+                // 마이크 모드: 마이크 입력 버퍼에 1블록 이상 들어왔을 때만 진행, 없으면 1ms 대기
+                if (mic_ring_buffer.get_available() < block_size) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+            } else {
+                // 가상 신호 / 음악 파일 재생 모드:
+                // 재생 출력 링 버퍼에 안전 쿠션(~70ms, 3072샘플) 이상 차있으면 2ms 양보
+                if (wasapi_render.is_running() && wasapi_render.get_buffered_samples() >= 3072) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+            }
+
+            if (!use_real_mic.load() && !wasapi_render.is_running()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
 
             // --- A. 하드웨어 시뮬레이터로부터 IPC 패킷 논블로킹 수신 ---
             int bytes_read = 0;
@@ -391,12 +414,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             fb_pkt.active_channel = static_cast<int8_t>(gui_window.get_dragging_fader());
             spectrum.generate_oled_buffer(bars, fb_pkt.oled_framebuffer);
             mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &fb_pkt, sizeof(fb_pkt));
-
-            // 샘플 블록 주기 동기화 (~11.6ms)
-            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_tp);
-            if (elapsed < block_duration) {
-                std::this_thread::sleep_for(block_duration - elapsed);
-            }
         }
     });
 
@@ -415,6 +432,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (audio_thread.joinable()) {
         audio_thread.join();
     }
+
+    // 고해상도 타이머 해제
+    timeEndPeriod(1);
 
     return 0;
 }

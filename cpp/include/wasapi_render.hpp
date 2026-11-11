@@ -42,6 +42,8 @@ public:
 
     WasapiRenderEngine()
         : m_is_running(false),
+          m_is_event_driven(false),
+          m_hAudioEvent(nullptr),
           m_current_device_idx(-1),
           m_pEnum(nullptr),
           m_pDevice(nullptr),
@@ -49,8 +51,7 @@ public:
           m_pRenderClient(nullptr),
           m_pwfx(nullptr),
           m_buffer_frame_count(0),
-          m_ring_buffer(32768, 2),
-          m_resample_phase(0.0f) {
+          m_ring_buffer(65536, 2) {
         
         CoInitialize(nullptr);
         CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -159,20 +160,50 @@ public:
             return false;
         }
 
-        // 20ms 버퍼 (~200,000 hns)
-        REFERENCE_TIME hnsBufferDuration = 200000;
+        // 안정적인 50ms 버퍼 (~500,000 hns)
+        REFERENCE_TIME hnsBufferDuration = 500000;
+        m_hAudioEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        m_is_event_driven = false;
+
+        // 이벤트 기반 WASAPI 초기화 시도
         hr = m_pAudioClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            0,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
             hnsBufferDuration,
             0,
             m_pwfx,
             nullptr
         );
 
-        if (FAILED(hr)) {
-            cleanup_com();
-            return false;
+        if (SUCCEEDED(hr) && m_hAudioEvent) {
+            if (SUCCEEDED(m_pAudioClient->SetEventHandle(m_hAudioEvent))) {
+                m_is_event_driven = true;
+            }
+        }
+
+        if (!m_is_event_driven) {
+            // 이벤트 모드 실패 시 일반 공유 모드로 재초기화
+            if (m_pAudioClient) {
+                m_pAudioClient->Release();
+                m_pAudioClient = nullptr;
+            }
+            hr = m_pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&m_pAudioClient);
+            if (FAILED(hr) || !m_pAudioClient) {
+                cleanup_com();
+                return false;
+            }
+            hr = m_pAudioClient->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0,
+                hnsBufferDuration,
+                0,
+                m_pwfx,
+                nullptr
+            );
+            if (FAILED(hr)) {
+                cleanup_com();
+                return false;
+            }
         }
 
         hr = m_pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&m_pRenderClient);
@@ -187,8 +218,14 @@ public:
             return false;
         }
 
+        // 초기 시작 시 버퍼를 무음으로 완전히 채워 시작 시 첫 프레임 언더런 방지
+        BYTE* pInitData = nullptr;
+        if (SUCCEEDED(m_pRenderClient->GetBuffer(m_buffer_frame_count, &pInitData)) && pInitData) {
+            std::memset(pInitData, 0, m_buffer_frame_count * m_pwfx->nBlockAlign);
+            m_pRenderClient->ReleaseBuffer(m_buffer_frame_count, 0);
+        }
+
         m_ring_buffer.clear();
-        m_resample_phase = 0.0f;
         m_current_device_idx = device_idx;
         m_is_running = true;
 
@@ -204,6 +241,9 @@ public:
 
     void stop() {
         m_is_running = false;
+        if (m_hAudioEvent) {
+            SetEvent(m_hAudioEvent);
+        }
         if (m_render_thread.joinable()) {
             m_render_thread.join();
         }
@@ -213,6 +253,10 @@ public:
         }
 
         cleanup_com();
+        if (m_hAudioEvent) {
+            CloseHandle(m_hAudioEvent);
+            m_hAudioEvent = nullptr;
+        }
         m_ring_buffer.clear();
         m_current_device_idx = -1;
     }
@@ -224,11 +268,17 @@ public:
         }
     }
 
+    size_t get_buffered_samples() const {
+        return m_ring_buffer.get_available();
+    }
+
     bool is_running() const { return m_is_running; }
     int get_current_device_index() const { return m_current_device_idx; }
 
 private:
     std::atomic<bool> m_is_running;
+    bool m_is_event_driven;
+    HANDLE m_hAudioEvent;
     int m_current_device_idx;
 
     IMMDeviceEnumerator* m_pEnum;
@@ -240,7 +290,6 @@ private:
 
     AudioRingBuffer m_ring_buffer;
     std::thread m_render_thread;
-    float m_resample_phase;
 
     void cleanup_com() {
         if (m_pwfx) {
@@ -262,6 +311,8 @@ private:
     }
 
     void render_loop() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
         int device_rate = m_pwfx ? m_pwfx->nSamplesPerSec : 48000;
         int channels = m_pwfx ? m_pwfx->nChannels : 2;
         bool is_float = false;
@@ -271,7 +322,6 @@ private:
                 is_float = true;
             } else if (m_pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
                 WAVEFORMATEXTENSIBLE* pExt = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(m_pwfx);
-                // SubFormat GUID check for IEEE Float {00000003-0000-0010-8000-00aa00389b71}
                 static const GUID GUID_FLOAT = 
                     { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
                 if (IsEqualGUID(pExt->SubFormat, GUID_FLOAT)) {
@@ -280,61 +330,80 @@ private:
             }
         }
 
-        std::vector<float> src_buf(2048 * 2);
-        std::vector<float> resampled_buf(2048 * 2);
+        std::vector<float> resampled_buf(4096 * 2);
+        std::vector<float> staging_in(4096 * 2);
+        size_t staging_avail = 0;
+        size_t staging_pos = 0;
+
+        float prev_in[2] = { 0.0f, 0.0f };
+        float curr_in[2] = { 0.0f, 0.0f };
+        double phase = 1.0; // 최초 실행 시 즉시 샘플 패치 트리거
+
+        double step = static_cast<double>(SOURCE_RATE) / static_cast<double>(device_rate);
 
         while (m_is_running) {
+            if (m_is_event_driven && m_hAudioEvent) {
+                DWORD wr = WaitForSingleObject(m_hAudioEvent, 50);
+                if (wr != WAIT_OBJECT_0) {
+                    if (!m_is_running) break;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+
+            if (!m_is_running) break;
+
             UINT32 padding = 0;
             HRESULT hr = m_pAudioClient->GetCurrentPadding(&padding);
             if (FAILED(hr)) break;
 
             UINT32 frames_needed = m_buffer_frame_count - padding;
-            if (frames_needed == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                continue;
-            }
+            if (frames_needed == 0) continue;
 
-            // 요청된 출력 프레임에 해당하는 44.1kHz 입력 프레임 수 계산
-            float step = static_cast<float>(SOURCE_RATE) / static_cast<float>(device_rate);
-            size_t src_frames_needed = static_cast<size_t>(std::ceil(frames_needed * step)) + 2;
-
-            if (src_buf.size() < src_frames_needed * 2) {
-                src_buf.resize(src_frames_needed * 2);
-            }
             if (resampled_buf.size() < frames_needed * 2) {
                 resampled_buf.resize(frames_needed * 2);
             }
 
-            size_t available = m_ring_buffer.get_available();
-            if (available < src_frames_needed) {
-                // 링 버퍼에 충분한 샘플이 없으면 언더런 방지 무음 채우기
-                std::fill(src_buf.begin(), src_buf.begin() + src_frames_needed * 2, 0.0f);
+            if (device_rate == SOURCE_RATE) {
+                // 44.1kHz -> 44.1kHz: 리샘플링 불필요, 링버퍼 직접 읽기
+                size_t read_frames = m_ring_buffer.read(resampled_buf.data(), frames_needed);
+                if (read_frames < frames_needed) {
+                    std::fill(resampled_buf.begin() + read_frames * 2, resampled_buf.begin() + frames_needed * 2, 0.0f);
+                }
             } else {
-                m_ring_buffer.read(src_buf.data(), src_frames_needed);
-            }
+                // 연속 위상 선형 보간 리샘플링 (샘플 누락 및 경계 클릭 완전 제거)
+                for (UINT32 i = 0; i < frames_needed; ++i) {
+                    while (phase >= 1.0) {
+                        phase -= 1.0;
+                        prev_in[0] = curr_in[0];
+                        prev_in[1] = curr_in[1];
 
-            // 선형 보간 리샘플링 (44.1kHz -> Device Rate)
-            for (UINT32 i = 0; i < frames_needed; ++i) {
-                float pos = m_resample_phase + i * step;
-                size_t idx0 = static_cast<size_t>(pos);
-                size_t idx1 = idx0 + 1;
-                float frac = pos - idx0;
+                        if (staging_pos >= staging_avail) {
+                            // 스테이징 버퍼 갱신 (링버퍼에서 청크 일괄 읽기 -> 락 오버헤드 최소화)
+                            size_t fetch_size = std::max<size_t>(512, static_cast<size_t>((frames_needed - i) * step) + 64);
+                            if (staging_in.size() < fetch_size * 2) staging_in.resize(fetch_size * 2);
+                            staging_avail = m_ring_buffer.read(staging_in.data(), fetch_size);
+                            staging_pos = 0;
+                        }
 
-                if (idx1 < src_frames_needed) {
-                    resampled_buf[i * 2]     = (1.0f - frac) * src_buf[idx0 * 2]     + frac * src_buf[idx1 * 2];
-                    resampled_buf[i * 2 + 1] = (1.0f - frac) * src_buf[idx0 * 2 + 1] + frac * src_buf[idx1 * 2 + 1];
-                } else if (idx0 < src_frames_needed) {
-                    resampled_buf[i * 2]     = src_buf[idx0 * 2];
-                    resampled_buf[i * 2 + 1] = src_buf[idx0 * 2 + 1];
-                } else {
-                    resampled_buf[i * 2]     = 0.0f;
-                    resampled_buf[i * 2 + 1] = 0.0f;
+                        if (staging_pos < staging_avail) {
+                            curr_in[0] = staging_in[staging_pos * 2];
+                            curr_in[1] = staging_in[staging_pos * 2 + 1];
+                            staging_pos++;
+                        } else {
+                            curr_in[0] = 0.0f;
+                            curr_in[1] = 0.0f;
+                        }
+                    }
+
+                    float frac = static_cast<float>(phase);
+                    resampled_buf[i * 2]     = (1.0f - frac) * prev_in[0] + frac * curr_in[0];
+                    resampled_buf[i * 2 + 1] = (1.0f - frac) * prev_in[1] + frac * curr_in[1];
+                    phase += step;
                 }
             }
 
-            m_resample_phase = (m_resample_phase + frames_needed * step) - static_cast<size_t>(m_resample_phase + frames_needed * step);
-
-            // WASAPI 버퍼 획득 및 데이터 쓰기
+            // WASAPI 렌더 버퍼에 데이터 복사
             BYTE* pData = nullptr;
             hr = m_pRenderClient->GetBuffer(frames_needed, &pData);
             if (SUCCEEDED(hr) && pData) {
@@ -343,7 +412,6 @@ private:
                     if (channels == 2) {
                         std::memcpy(dst, resampled_buf.data(), frames_needed * 2 * sizeof(float));
                     } else {
-                        // 다채널 (5.1 등) 대응: L/R 채널 복사, 나머지 0
                         for (UINT32 i = 0; i < frames_needed; ++i) {
                             dst[i * channels]     = resampled_buf[i * 2];
                             dst[i * channels + 1] = resampled_buf[i * 2 + 1];
@@ -353,7 +421,6 @@ private:
                         }
                     }
                 } else {
-                    // 16-bit PCM 포맷
                     int16_t* dst = reinterpret_cast<int16_t*>(pData);
                     for (UINT32 i = 0; i < frames_needed; ++i) {
                         float l = std::clamp(resampled_buf[i * 2], -1.0f, 1.0f);
@@ -365,11 +432,8 @@ private:
                         }
                     }
                 }
-
                 m_pRenderClient->ReleaseBuffer(frames_needed, 0);
             }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(3));
         }
     }
 };
