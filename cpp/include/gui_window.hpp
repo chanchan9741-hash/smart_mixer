@@ -104,6 +104,8 @@ public:
     void set_ai_separate_callback(AISeparateCallback cb) { m_ai_separate_callback = cb; }
     void set_ai_busy(bool busy) { m_is_ai_busy = busy; }
     bool is_ai_busy() const { return m_is_ai_busy.load(); }
+    void set_ai_progress(int pct) { m_ai_progress = pct; }
+    int get_ai_progress() const { return m_ai_progress.load(); }
     int get_dragging_fader() const { return m_dragging_fader; }
 
     void open_file_dialog() {
@@ -113,7 +115,7 @@ public:
         ofn.lpstrFilter = L"오디오 파일 (*.mp3;*.wav;*.flac;*.m4a;*.wma)\0*.mp3;*.wav;*.flac;*.m4a;*.wma\0All Files (*.*)\0*.*\0";
         ofn.lpstrFile = szFile;
         ofn.nMaxFile = MAX_PATH;
-        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetOpenFileNameW(&ofn)) {
             if (m_file_open_callback) {
                 m_file_open_callback(szFile);
@@ -250,6 +252,7 @@ private:
     FileExportCallback m_file_export_callback;
     AISeparateCallback m_ai_separate_callback;
     std::atomic<bool> m_is_ai_busy{false};
+    std::atomic<int> m_ai_progress{0};
     std::wstring m_active_device_name;
     std::wstring m_active_output_name;
 
@@ -476,6 +479,12 @@ private:
             if (x >= 874 && x <= 948 && y >= 492 && y <= 514) {
                 if (m_is_ai_busy.load()) {
                     show_toast("AI 스템 분리가 진행 중입니다. 잠시만 기다려주세요...", 2.5f);
+                    return;
+                }
+                if (!m_file_player.has_ai_stems()) {
+                    if (m_ai_separate_callback) {
+                        m_ai_separate_callback();
+                    }
                     return;
                 }
                 if (m_file_player.is_playing()) {
@@ -946,17 +955,24 @@ private:
             SetTextColor(hdc, RGB(180, 185, 195));
             DrawTextW(hdc, timeBuf, -1, &titleRc, DT_RIGHT | DT_SINGLELINE);
 
-            // Seek Bar
+            // Seek Bar (AI 분리 중에는 분리 진행률 바로 표시)
             RECT barBg = { 874, 482, 1030, 488 };
             HBRUSH bgBr = CreateSolidBrush(RGB(40, 44, 52));
             FillRect(hdc, &barBg, bgBr);
             DeleteObject(bgBr);
 
-            float prog = (dur_sec > 0.0f) ? (cur_sec / dur_sec) : 0.0f;
+            bool is_busy = m_is_ai_busy.load();
+            int ai_pct = m_ai_progress.load();
+            float prog = 0.0f;
+            if (is_busy) {
+                prog = ai_pct / 100.0f;
+            } else if (dur_sec > 0.0f) {
+                prog = cur_sec / dur_sec;
+            }
             prog = std::clamp(prog, 0.0f, 1.0f);
             int bar_fill_w = static_cast<int>(prog * (1030 - 874));
             RECT barFill = { 874, 482, 874 + bar_fill_w, 488 };
-            HBRUSH fillBr = CreateSolidBrush(RGB(0, 210, 255));
+            HBRUSH fillBr = CreateSolidBrush(is_busy ? RGB(255, 200, 50) : RGB(0, 210, 255));
             FillRect(hdc, &barFill, fillBr);
             DeleteObject(fillBr);
 
@@ -979,26 +995,27 @@ private:
             // 🤖 Demucs AI 스템 분리 버튼
             RECT aiBtnRc = { 874, 518, 1030, 542 };
             bool has_ai = m_file_player.has_ai_stems();
-            bool is_busy = m_is_ai_busy.load();
 
             if (is_busy) {
                 HBRUSH aiBr = CreateSolidBrush(RGB(90, 70, 15));
                 FillRect(hdc, &aiBtnRc, aiBr);
                 DeleteObject(aiBr);
                 SetTextColor(hdc, RGB(255, 220, 50));
-                DrawTextW(hdc, L"⏳ AI 스템 분리 중...", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                wchar_t busyTxt[64];
+                swprintf_s(busyTxt, L"⏳ HTDemucs 분리 중... %d%%", ai_pct);
+                DrawTextW(hdc, busyTxt, -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             } else if (has_ai) {
                 HBRUSH aiBr = CreateSolidBrush(RGB(16, 75, 45));
                 FillRect(hdc, &aiBtnRc, aiBr);
                 DeleteObject(aiBr);
                 SetTextColor(hdc, RGB(57, 255, 20));
-                DrawTextW(hdc, L"✨ AI 스템 활성화됨 (Demucs)", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(hdc, L"✨ HTDemucs AI 스템 적용됨", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             } else {
                 HBRUSH aiBr = CreateSolidBrush(RGB(64, 38, 96));
                 FillRect(hdc, &aiBtnRc, aiBr);
                 DeleteObject(aiBr);
                 SetTextColor(hdc, RGB(220, 180, 255));
-                DrawTextW(hdc, L"🤖 Demucs AI 분리 실행", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(hdc, L"🤖 HTDemucs AI 분리 실행", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
 
             // 💾 3-Way 스템 파일 분리 저장 버튼
@@ -1013,13 +1030,15 @@ private:
             RECT guideRc = { 874, 574, 1030, 598 };
             if (is_busy) {
                 SetTextColor(hdc, RGB(255, 200, 50));
-                DrawTextW(hdc, L"AI 분리 중... (완료 시 자동 재생)", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+                wchar_t guideTxt[64];
+                swprintf_s(guideTxt, L"AI 분리 진행률 %d%% (완료 시 재생)", ai_pct);
+                DrawTextW(hdc, guideTxt, -1, &guideRc, DT_CENTER | DT_SINGLELINE);
             } else if (has_ai) {
                 SetTextColor(hdc, RGB(57, 255, 20));
-                DrawTextW(hdc, L"Demucs AI: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+                DrawTextW(hdc, L"HTDemucs: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
             } else {
-                SetTextColor(hdc, RGB(0, 210, 255));
-                DrawTextW(hdc, L"STFT 실시간: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+                SetTextColor(hdc, RGB(255, 187, 0));
+                DrawTextW(hdc, L"AI 분리 대기 (🤖 버튼 클릭)", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
             }
 
         } else {

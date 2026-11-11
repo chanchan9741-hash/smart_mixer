@@ -257,12 +257,37 @@ public:
         return m_file_path;
     }
 
+    // 현재 로드된 원곡 PCM 데이터를 표준 16-bit WAV로 저장 (MP3/FLAC/M4A -> WAV 변환용)
+    bool save_loaded_to_wav(const std::wstring& wav_path) {
+        std::vector<float> all_samples;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_samples.empty()) return false;
+            all_samples = m_samples;
+        }
+        return write_wav_file(wav_path, all_samples, m_target_sample_rate, 2);
+    }
+
     // 전체 로드된 음악 파일을 스템 분리하여 3개의 WAV 파일로 일괄 저장
     bool export_separated_stems(const std::wstring& out_vocal_path,
                                 const std::wstring& out_beat_path,
                                 const std::wstring& out_inst_path,
                                 StemSeparator& separator,
                                 std::function<void(float progress)> progress_cb = nullptr) {
+        if (m_has_ai_stems.load() && !m_samples_vocal.empty()) {
+            std::vector<float> v_copy, b_copy, i_copy;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                v_copy = m_samples_vocal;
+                b_copy = m_samples_beat;
+                i_copy = m_samples_inst;
+            }
+            bool ok_v = write_wav_file(out_vocal_path, v_copy, m_target_sample_rate);
+            bool ok_b = write_wav_file(out_beat_path, b_copy, m_target_sample_rate);
+            bool ok_i = write_wav_file(out_inst_path, i_copy, m_target_sample_rate);
+            return ok_v && ok_b && ok_i;
+        }
+
         if (m_samples.empty()) return false;
 
         std::vector<float> all_samples;

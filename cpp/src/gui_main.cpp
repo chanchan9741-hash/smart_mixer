@@ -126,9 +126,56 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &pkt, sizeof(pkt));
     });
 
-    // 5. 음원 파일 로드 및 스템 파일 일괄 내보내기 콜백
+    // 5. 음원 파일 로드 및 Demucs HTDemucs AI 스템 분리 파이프라인
     std::atomic<bool> use_audio_file(false);
     std::atomic<bool> is_demucs_running(false);
+
+    auto resolve_demucs_script = []() -> std::wstring {
+        wchar_t exe_buf[MAX_PATH] = {0};
+        GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+        std::wstring exe_path(exe_buf);
+        size_t slash = exe_path.find_last_of(L"\\/");
+        std::wstring exe_dir = (slash != std::wstring::npos) ? exe_path.substr(0, slash) : L".";
+
+        std::vector<std::wstring> candidates = {
+            exe_dir + L"\\scripts\\demucs_runner.py",
+            exe_dir + L"\\..\\scripts\\demucs_runner.py",
+            L"scripts\\demucs_runner.py",
+            L"..\\scripts\\demucs_runner.py"
+        };
+        for (const auto& c : candidates) {
+            if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                wchar_t full_buf[MAX_PATH] = {0};
+                if (GetFullPathNameW(c.c_str(), MAX_PATH, full_buf, nullptr)) {
+                    return std::wstring(full_buf);
+                }
+                return c;
+            }
+        }
+        return exe_dir + L"\\..\\scripts\\demucs_runner.py";
+    };
+
+    auto resolve_python_exe = []() -> std::wstring {
+        const wchar_t* local_app_data = _wgetenv(L"LOCALAPPDATA");
+        if (local_app_data) {
+            std::wstring base(local_app_data);
+            std::vector<std::wstring> py_candidates = {
+                base + L"\\Python\\pythoncore-3.14-64\\python.exe",
+                base + L"\\Python\\bin\\python.exe",
+                base + L"\\Programs\\Python\\Python314\\python.exe",
+                base + L"\\Programs\\Python\\Python313\\python.exe",
+                base + L"\\Programs\\Python\\Python312\\python.exe",
+                base + L"\\Programs\\Python\\Python311\\python.exe",
+                base + L"\\Programs\\Python\\Python310\\python.exe"
+            };
+            for (const auto& p : py_candidates) {
+                if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    return p;
+                }
+            }
+        }
+        return L"python";
+    };
 
     auto trigger_demucs_separation = [&]() {
         if (!file_player.is_loaded()) {
@@ -144,28 +191,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         std::thread([&]() {
             is_demucs_running.store(true);
             gui_window.set_ai_busy(true);
-            file_player.pause(); // 분리 완료될 때까지 재생 일시정지 (대기)
+            gui_window.set_ai_progress(1);
+            file_player.pause(); // AI 스템 분리 완료 시까지 재생 대기
 
-            gui_window.show_toast("⏳ Demucs AI 스템 분리 중... (약 10초 대기 후 00:00부터 재생)", 12.0f);
+            gui_window.show_toast("⏳ HTDemucs AI 스템 분리 준비 중...", 15.0f);
 
             std::wstring in_path = file_player.get_file_path();
             size_t slash = in_path.find_last_of(L"\\/");
             std::wstring dir = (slash != std::wstring::npos) ? in_path.substr(0, slash) : L".";
             size_t dot = in_path.find_last_of(L".");
-            std::wstring base_name = (dot != std::wstring::npos && dot > slash)
+            std::wstring base_name = (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash))
                                    ? in_path.substr(slash + 1, dot - slash - 1)
                                    : in_path.substr(slash + 1);
 
             std::wstring out_dir = dir + L"\\demucs_stems";
+            CreateDirectoryW(out_dir.c_str(), nullptr);
 
-            // demucs_runner.py 스크립트 경로 탐색
-            std::wstring script_path = L"scripts\\demucs_runner.py";
-            if (GetFileAttributesW(script_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                script_path = L"..\\scripts\\demucs_runner.py";
+            std::wstring prog_file = out_dir + L"\\progress.txt";
+            _wremove(prog_file.c_str());
+
+            // Media Foundation으로 디코딩된 PCM을 표준 16-bit WAV로 임시 저장 (ffmpeg 없이 MP3/M4A/FLAC 완벽 지원)
+            std::wstring temp_input_wav = out_dir + L"\\" + base_name + L"_demucs_input.wav";
+            if (!file_player.save_loaded_to_wav(temp_input_wav)) {
+                gui_window.set_ai_busy(false);
+                is_demucs_running.store(false);
+                gui_window.show_toast("❌ 임시 WAV 변환 실패 (디스크 권한을 확인하세요)", 4.0f);
+                return;
             }
 
-            // python "scripts\demucs_runner.py" "<in_path>" "<out_dir>"
-            std::wstring cmd = L"python \"" + script_path + L"\" \"" + in_path + L"\" \"" + out_dir + L"\"";
+            std::wstring script_path = resolve_demucs_script();
+            std::wstring py_exe = resolve_python_exe();
+
+            std::wstring cmd = L"\"" + py_exe + L"\" \"" + script_path + L"\" \"" + temp_input_wav + L"\" \"" + out_dir + L"\" \"" + base_name + L"\"";
 
             STARTUPINFOW si = { sizeof(si) };
             PROCESS_INFORMATION pi = { 0 };
@@ -190,7 +247,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
             bool success = false;
             if (created) {
-                WaitForSingleObject(pi.hProcess, 180000); // 최대 3분 대기
+                // 250ms 주기로 progress.txt를 폴링하여 GUI 진행률 실시간 업데이트 (최대 5분 대기)
+                for (int tick = 0; tick < 1200; ++tick) {
+                    DWORD wait_res = WaitForSingleObject(pi.hProcess, 250);
+                    FILE* pfp = nullptr;
+                    if (_wfopen_s(&pfp, prog_file.c_str(), L"r") == 0 && pfp) {
+                        int pct = 0;
+                        if (fscanf_s(pfp, "%d", &pct) == 1) {
+                            pct = std::clamp(pct, 1, 99);
+                            gui_window.set_ai_progress(pct);
+                            gui_window.show_toast("⏳ HTDemucs 딥러닝 스템 분리 중... (" + std::to_string(pct) + "%)", 5.0f);
+                        }
+                        fclose(pfp);
+                    }
+                    if (wait_res == WAIT_OBJECT_0) {
+                        break;
+                    }
+                }
+
                 DWORD exit_code = 1;
                 GetExitCodeProcess(pi.hProcess, &exit_code);
                 CloseHandle(pi.hProcess);
@@ -200,24 +274,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
             }
 
+            _wremove(temp_input_wav.c_str());
+            _wremove(prog_file.c_str());
+
+            gui_window.set_ai_progress(100);
             gui_window.set_ai_busy(false);
             is_demucs_running.store(false);
 
             if (success) {
-                std::wstring v_path = out_dir + L"\\" + base_name + L"_vocal.wav";
-                std::wstring b_path = out_dir + L"\\" + base_name + L"_beat.wav";
-                std::wstring i_path = out_dir + L"\\" + base_name + L"_inst.wav";
+                std::wstring v_path = out_dir + L"\\" + base_name + L"_ai_vocal.wav";
+                std::wstring b_path = out_dir + L"\\" + base_name + L"_ai_beat.wav";
+                std::wstring i_path = out_dir + L"\\" + base_name + L"_ai_inst.wav";
 
                 bool loaded = file_player.load_ai_stems(v_path, b_path, i_path);
                 if (loaded) {
                     file_player.seek(0.0f); // 00:00부터
                     file_player.play();     // 완벽 분리된 스튜디오 음원으로 재생 시작!
-                    gui_window.show_toast("🎉 Demucs AI 스템 분리 완료! 스튜디오 음원으로 재생을 시작합니다.", 5.0f);
+                    gui_window.show_toast("🎉 HTDemucs AI 스템 분리 완료! 00:00부터 재생을 시작합니다.", 5.0f);
                 } else {
-                    gui_window.show_toast("❌ AI 스템 파일 로드 실패 (파일 손상 또는 미생성)", 4.0f);
+                    gui_window.show_toast("❌ AI 스템 파일 로드 실패 (demucs_log.txt 확인)", 5.0f);
                 }
             } else {
-                gui_window.show_toast("❌ Demucs 실행 실패. Python 환경 및 demucs 패키지를 확인하세요.", 5.0f);
+                gui_window.show_toast("❌ HTDemucs 분리 실패 (demucs_stems/demucs_log.txt 확인)", 5.0f);
             }
         }).detach();
     };
@@ -228,41 +306,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             use_audio_file.store(true);
             gui_window.refresh_devices_with_file();
 
-            // AI 스템이 이미 존재하는지 확인 (예: demucs_stems 폴더 또는 동일 폴더)
+            // HTDemucs 전용 AI 스템(_ai_vocal.wav 등)이 이미 캐시되어 있는지 확인
             size_t slash = path.find_last_of(L"\\/");
             std::wstring dir = (slash != std::wstring::npos) ? path.substr(0, slash) : L".";
             size_t dot = path.find_last_of(L".");
-            std::wstring base_name = (dot != std::wstring::npos && dot > slash)
+            std::wstring base_name = (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash))
                                    ? path.substr(slash + 1, dot - slash - 1)
                                    : path.substr(slash + 1);
 
             std::wstring demucs_dir = dir + L"\\demucs_stems";
-            std::wstring v1 = demucs_dir + L"\\" + base_name + L"_vocal.wav";
-            std::wstring b1 = demucs_dir + L"\\" + base_name + L"_beat.wav";
-            std::wstring i1 = demucs_dir + L"\\" + base_name + L"_inst.wav";
-
-            std::wstring v2 = dir + L"\\" + base_name + L"_vocal.wav";
-            std::wstring b2 = dir + L"\\" + base_name + L"_beat.wav";
-            std::wstring i2 = dir + L"\\" + base_name + L"_inst.wav";
+            std::wstring v1 = demucs_dir + L"\\" + base_name + L"_ai_vocal.wav";
+            std::wstring b1 = demucs_dir + L"\\" + base_name + L"_ai_beat.wav";
+            std::wstring i1 = demucs_dir + L"\\" + base_name + L"_ai_inst.wav";
 
             bool loaded_ai = false;
             if (GetFileAttributesW(v1.c_str()) != INVALID_FILE_ATTRIBUTES &&
                 GetFileAttributesW(b1.c_str()) != INVALID_FILE_ATTRIBUTES &&
                 GetFileAttributesW(i1.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 loaded_ai = file_player.load_ai_stems(v1, b1, i1);
-            } else if (GetFileAttributesW(v2.c_str()) != INVALID_FILE_ATTRIBUTES &&
-                       GetFileAttributesW(b2.c_str()) != INVALID_FILE_ATTRIBUTES &&
-                       GetFileAttributesW(i2.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                loaded_ai = file_player.load_ai_stems(v2, b2, i2);
             }
 
             if (loaded_ai) {
-                gui_window.show_toast("기존 AI 분리 스템이 발견되어 즉시 재생을 시작합니다! (Demucs)", 4.0f);
+                gui_window.show_toast("✨ 기존 HTDemucs AI 스템 캐시 로드 완료! 즉시 재생합니다.", 4.0f);
+                file_player.seek(0.0f);
                 file_player.play();
             } else {
-                // 즉시 재생하지 않고 대기: AI 스템 분리 완료 후 00:00부터 완벽 분리 재생
+                // 즉시 재생하지 않고 대기: HTDemucs AI 스템 분리 완료 후 00:00부터 재생
                 file_player.pause();
-                gui_window.show_toast("⏳ Demucs AI 스템 분리 중... (약 10초 대기 후 재생)", 12.0f);
                 trigger_demucs_separation();
             }
         } else {
@@ -477,15 +547,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             // --- C. 스템 분리 (S-FR-4) ---
             if (is_file_active) {
                 if (file_player.has_ai_stems()) {
-                    // Demucs AI 사전 분리 스템 완벽 동기화 재생
+                    // HTDemucs AI 사전 분리 스템 완벽 동기화 재생
                     file_player.read_frames_stems(vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
                     for (size_t i = 0; i < block_size * 2; ++i) {
                         file_block[i] = vocal_buf[i] + beat_buf[i] + inst_buf[i];
                     }
+                    if (!stem_separator.is_enabled()) {
+                        std::copy(file_block.begin(), file_block.end(), vocal_buf.begin());
+                        std::fill(beat_buf.begin(), beat_buf.end(), 0.0f);
+                        std::fill(inst_buf.begin(), inst_buf.end(), 0.0f);
+                    }
                 } else {
-                    // 실시간 STFT 분리 (COLA 50% Overlap-Add)
-                    file_player.read_frames(file_block.data(), block_size);
-                    stem_separator.process(file_block.data(), vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+                    // HTDemucs 분리 완료 전까지는 실시간 STFT를 돌리지 않고 대기 (무음 유지)
+                    std::fill(file_block.begin(), file_block.end(), 0.0f);
+                    std::fill(vocal_buf.begin(), vocal_buf.end(), 0.0f);
+                    std::fill(beat_buf.begin(), beat_buf.end(), 0.0f);
+                    std::fill(inst_buf.begin(), inst_buf.end(), 0.0f);
                 }
             } else {
                 stem_separator.process(in_block.data(), vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
