@@ -49,6 +49,7 @@ public:
     using FaderEndCallback = std::function<void(int ch)>;
     using FileOpenCallback = std::function<void(const std::wstring&)>;
     using FileExportCallback = std::function<void()>;
+    using AISeparateCallback = std::function<void()>;
 
     MixerGUIWindow(HINSTANCE hInstance,
                    AudioMixer& mixer,
@@ -83,6 +84,7 @@ public:
           m_fader_drag_end_callback(nullptr),
           m_file_open_callback(nullptr),
           m_file_export_callback(nullptr),
+          m_ai_separate_callback(nullptr),
           m_active_device_name(L"Virtual Audio Generator"),
           m_active_output_name(L"Default Output") {
         
@@ -99,6 +101,7 @@ public:
     void set_fader_drag_end_callback(FaderEndCallback cb) { m_fader_drag_end_callback = cb; }
     void set_file_open_callback(FileOpenCallback cb) { m_file_open_callback = cb; }
     void set_file_export_callback(FileExportCallback cb) { m_file_export_callback = cb; }
+    void set_ai_separate_callback(AISeparateCallback cb) { m_ai_separate_callback = cb; }
     int get_dragging_fader() const { return m_dragging_fader; }
 
     void open_file_dialog() {
@@ -243,6 +246,7 @@ private:
     FaderEndCallback m_fader_drag_end_callback;
     FileOpenCallback m_file_open_callback;
     FileExportCallback m_file_export_callback;
+    AISeparateCallback m_ai_separate_callback;
     std::wstring m_active_device_name;
     std::wstring m_active_output_name;
 
@@ -444,29 +448,29 @@ private:
         }
 
         // 4. Stem 분리 및 음원 파일 제어
-        // Stem Toggle (x: 874 ~ 1030, y: 406 ~ 436)
-        if (x >= 874 && x <= 1030 && y >= 406 && y <= 436) {
+        // Stem Toggle (x: 874 ~ 1030, y: 406 ~ 432)
+        if (x >= 874 && x <= 1030 && y >= 406 && y <= 432) {
             m_stem.set_enabled(!m_stem.is_enabled());
             return;
         }
 
-        // 📂 음원 파일 불러오기 버튼 (x: 874 ~ 1030, y: 442 ~ 470)
-        if (x >= 874 && x <= 1030 && y >= 442 && y <= 470) {
+        // 📂 음원 파일 불러오기 버튼 (x: 874 ~ 1030, y: 436 ~ 460)
+        if (x >= 874 && x <= 1030 && y >= 436 && y <= 460) {
             open_file_dialog();
             return;
         }
 
         if (m_file_player.is_loaded()) {
-            // Seek Bar 클릭 이동 (x: 874 ~ 1030, y: 494 ~ 504)
-            if (x >= 874 && x <= 1030 && y >= 494 && y <= 504) {
+            // Seek Bar 클릭 이동 (x: 874 ~ 1030, y: 480 ~ 490)
+            if (x >= 874 && x <= 1030 && y >= 480 && y <= 490) {
                 float norm = static_cast<float>(x - 874) / static_cast<float>(1030 - 874);
                 norm = std::clamp(norm, 0.0f, 1.0f);
                 m_file_player.seek(norm * m_file_player.get_duration_seconds());
                 return;
             }
 
-            // ▶ 재생 / ⏸ 일시정지 (x: 874 ~ 948, y: 508 ~ 534)
-            if (x >= 874 && x <= 948 && y >= 508 && y <= 534) {
+            // ▶ 재생 / ⏸ 일시정지 (x: 874 ~ 948, y: 492 ~ 514)
+            if (x >= 874 && x <= 948 && y >= 492 && y <= 514) {
                 if (m_file_player.is_playing()) {
                     m_file_player.pause();
                 } else {
@@ -475,14 +479,22 @@ private:
                 return;
             }
 
-            // ⏹ 정지 (x: 954 ~ 1030, y: 508 ~ 534)
-            if (x >= 954 && x <= 1030 && y >= 508 && y <= 534) {
+            // ⏹ 정지 (x: 954 ~ 1030, y: 492 ~ 514)
+            if (x >= 954 && x <= 1030 && y >= 492 && y <= 514) {
                 m_file_player.stop();
                 return;
             }
 
-            // 💾 3-Way 스템 파일 분리 저장 (x: 874 ~ 1030, y: 540 ~ 568)
-            if (x >= 874 && x <= 1030 && y >= 540 && y <= 568) {
+            // 🤖 Demucs AI 스템 분리 (x: 874 ~ 1030, y: 518 ~ 542)
+            if (x >= 874 && x <= 1030 && y >= 518 && y <= 542) {
+                if (m_ai_separate_callback) {
+                    m_ai_separate_callback();
+                }
+                return;
+            }
+
+            // 💾 3-Way 스템 파일 분리 저장 (x: 874 ~ 1030, y: 546 ~ 570)
+            if (x >= 874 && x <= 1030 && y >= 546 && y <= 570) {
                 if (m_file_export_callback) {
                     m_file_export_callback();
                 }
@@ -888,10 +900,10 @@ private:
         draw_rounded_card(hdc, stemRc, L"실시간 스템 분리 & 음원 (S-FR-4)");
 
         bool stem_on = m_stem.is_enabled();
-        draw_toggle_button(hdc, 874, 406, 1030, 436, L"STEM ACTIVE", stem_on, RGB(0, 104, 71), RGB(57, 255, 20));
+        draw_toggle_button(hdc, 874, 406, 1030, 432, L"STEM ACTIVE", stem_on, RGB(0, 104, 71), RGB(57, 255, 20));
 
         // 📂 음원 파일 불러오기 버튼
-        RECT openBtnRc = { 874, 442, 1030, 470 };
+        RECT openBtnRc = { 874, 436, 1030, 460 };
         HBRUSH openBr = CreateSolidBrush(RGB(28, 54, 96));
         FillRect(hdc, &openBtnRc, openBr);
         DeleteObject(openBr);
@@ -916,7 +928,7 @@ private:
             wchar_t timeBuf[64];
             swprintf_s(timeBuf, L"%02d:%02d / %02d:%02d", cur_m, cur_s, dur_m, dur_s);
 
-            RECT titleRc = { 874, 474, 1030, 492 };
+            RECT titleRc = { 874, 464, 1030, 478 };
             SetTextColor(hdc, RGB(255, 255, 255));
             DrawTextW(hdc, fname.c_str(), -1, &titleRc, DT_LEFT | DT_SINGLELINE);
 
@@ -924,7 +936,7 @@ private:
             DrawTextW(hdc, timeBuf, -1, &titleRc, DT_RIGHT | DT_SINGLELINE);
 
             // Seek Bar
-            RECT barBg = { 874, 496, 1030, 502 };
+            RECT barBg = { 874, 482, 1030, 488 };
             HBRUSH bgBr = CreateSolidBrush(RGB(40, 44, 52));
             FillRect(hdc, &barBg, bgBr);
             DeleteObject(bgBr);
@@ -932,44 +944,53 @@ private:
             float prog = (dur_sec > 0.0f) ? (cur_sec / dur_sec) : 0.0f;
             prog = std::clamp(prog, 0.0f, 1.0f);
             int bar_fill_w = static_cast<int>(prog * (1030 - 874));
-            RECT barFill = { 874, 496, 874 + bar_fill_w, 502 };
+            RECT barFill = { 874, 482, 874 + bar_fill_w, 488 };
             HBRUSH fillBr = CreateSolidBrush(RGB(0, 210, 255));
             FillRect(hdc, &barFill, fillBr);
             DeleteObject(fillBr);
 
             // 재생 / 정지 버튼
             bool playing = m_file_player.is_playing();
-            RECT playBtnRc = { 874, 508, 948, 534 };
+            RECT playBtnRc = { 874, 492, 948, 514 };
             HBRUSH pBr = CreateSolidBrush(playing ? RGB(0, 104, 71) : RGB(45, 48, 54));
             FillRect(hdc, &playBtnRc, pBr);
             DeleteObject(pBr);
             SetTextColor(hdc, playing ? RGB(57, 255, 20) : RGB(255, 255, 255));
             DrawTextW(hdc, playing ? L"⏸ PAUSE" : L"▶ PLAY", -1, &playBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            RECT stopBtnRc = { 954, 508, 1030, 534 };
+            RECT stopBtnRc = { 954, 492, 1030, 514 };
             HBRUSH stBr = CreateSolidBrush(RGB(60, 28, 28));
             FillRect(hdc, &stopBtnRc, stBr);
             DeleteObject(stBr);
             SetTextColor(hdc, RGB(255, 100, 100));
             DrawTextW(hdc, L"⏹ STOP", -1, &stopBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
+            // 🤖 Demucs AI 스템 분리 버튼
+            RECT aiBtnRc = { 874, 518, 1030, 542 };
+            bool has_ai = m_file_player.has_ai_stems();
+            HBRUSH aiBr = CreateSolidBrush(has_ai ? RGB(16, 75, 45) : RGB(64, 38, 96));
+            FillRect(hdc, &aiBtnRc, aiBr);
+            DeleteObject(aiBr);
+            SetTextColor(hdc, has_ai ? RGB(57, 255, 20) : RGB(220, 180, 255));
+            DrawTextW(hdc, has_ai ? L"✨ AI 스템 활성화됨 (Demucs)" : L"🤖 Demucs AI 스템 분리", -1, &aiBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
             // 💾 3-Way 스템 파일 분리 저장 버튼
-            RECT expBtnRc = { 874, 540, 1030, 568 };
-            HBRUSH expBr = CreateSolidBrush(RGB(48, 38, 70));
+            RECT expBtnRc = { 874, 546, 1030, 570 };
+            HBRUSH expBr = CreateSolidBrush(RGB(40, 44, 52));
             FillRect(hdc, &expBtnRc, expBr);
             DeleteObject(expBr);
-            SetTextColor(hdc, RGB(220, 180, 255));
-            DrawTextW(hdc, L"💾 3-Way 스템 파일 분리 저장", -1, &expBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(hdc, RGB(180, 185, 195));
+            DrawTextW(hdc, L"💾 3-Way WAV 파일 저장", -1, &expBtnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
             // 가이드 텍스트
             RECT guideRc = { 874, 574, 1030, 598 };
-            SetTextColor(hdc, RGB(57, 255, 20));
-            DrawTextW(hdc, L"CH1:보컬 CH2:비트 CH4:악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
+            SetTextColor(hdc, has_ai ? RGB(57, 255, 20) : RGB(0, 210, 255));
+            DrawTextW(hdc, has_ai ? L"Demucs AI: CH1보컬 CH2비트 CH4악기" : L"STFT 실시간: CH1보컬 CH2비트 CH4악기", -1, &guideRc, DT_CENTER | DT_SINGLELINE);
 
         } else {
-            RECT stemTxtRc = { 874, 480, 1030, 595 };
+            RECT stemTxtRc = { 874, 470, 1030, 595 };
             SetTextColor(hdc, RGB(160, 165, 175));
-            DrawTextW(hdc, L"🎵 음원 로드 시 3채널 실시간 분리:\n\n• 보컬 (Mid)  -> CH 1 (MR제작)\n• 비트 (Bass) -> CH 2 (드럼)\n• 악기 (Side) -> CH 4 (반주)\n\n각 채널 독립 믹싱 및\nWAV 파일 분리 저장이 가능합니다.",
+            DrawTextW(hdc, L"🎵 음원 로드 시 3채널 실시간 분리:\n\n• 보컬 (Mid)  -> CH 1 (MR제작)\n• 비트 (Bass) -> CH 2 (드럼)\n• 악기 (Side) -> CH 4 (반주)\n\nDemucs AI(HTDemucs)를\n통한 스튜디오급 분리 지원!",
                       -1, &stemTxtRc, DT_LEFT);
         }
 

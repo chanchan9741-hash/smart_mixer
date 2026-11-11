@@ -55,7 +55,8 @@ public:
         : m_target_sample_rate(target_sample_rate),
           m_current_frame(0),
           m_is_playing(false),
-          m_loop(true) {}
+          m_loop(true),
+          m_has_ai_stems(false) {}
 
     ~AudioFilePlayer() {
         stop();
@@ -65,15 +66,14 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_is_playing = false;
         m_current_frame = 0;
+        m_has_ai_stems.store(false);
         m_samples.clear();
+        m_samples_vocal.clear();
+        m_samples_beat.clear();
+        m_samples_inst.clear();
 
         // 1. Windows Media Foundation을 활용하여 MP3, WAV, FLAC, M4A 등 임의 포맷 로드
-        bool success = load_via_media_foundation(file_path);
-
-        if (!success) {
-            // MF 실패 시 직접 WAV 파서 시도
-            success = load_via_direct_wav(file_path);
-        }
+        bool success = load_audio_data(file_path, m_samples);
 
         if (success && !m_samples.empty()) {
             m_file_path = file_path;
@@ -90,8 +90,41 @@ public:
         return false;
     }
 
+    bool load_ai_stems(const std::wstring& v_path, const std::wstring& b_path, const std::wstring& i_path) {
+        std::vector<float> v_samples, b_samples, i_samples;
+        if (!load_audio_data(v_path, v_samples)) return false;
+        if (!load_audio_data(b_path, b_samples)) return false;
+        if (!load_audio_data(i_path, i_samples)) return false;
+
+        size_t min_samples = std::min({v_samples.size(), b_samples.size(), i_samples.size()});
+        if (min_samples == 0) return false;
+
+        v_samples.resize(min_samples);
+        b_samples.resize(min_samples);
+        i_samples.resize(min_samples);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_samples_vocal = std::move(v_samples);
+        m_samples_beat = std::move(b_samples);
+        m_samples_inst = std::move(i_samples);
+        m_has_ai_stems.store(true);
+        return true;
+    }
+
+    void clear_ai_stems() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_has_ai_stems.store(false);
+        m_samples_vocal.clear();
+        m_samples_beat.clear();
+        m_samples_inst.clear();
+    }
+
+    bool has_ai_stems() const {
+        return m_has_ai_stems.load() && !m_samples_vocal.empty();
+    }
+
     void play() {
-        if (!m_samples.empty()) {
+        if (!m_samples.empty() || (m_has_ai_stems.load() && !m_samples_vocal.empty())) {
             m_is_playing = true;
         }
     }
@@ -107,8 +140,13 @@ public:
 
     void seek(float position_seconds) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_samples.empty()) return;
-        size_t total_frames = m_samples.size() / 2;
+        size_t total_frames = 0;
+        if (m_has_ai_stems.load() && !m_samples_vocal.empty()) {
+            total_frames = m_samples_vocal.size() / 2;
+        } else if (!m_samples.empty()) {
+            total_frames = m_samples.size() / 2;
+        }
+        if (total_frames == 0) return;
         size_t target_frame = static_cast<size_t>(position_seconds * m_target_sample_rate);
         m_current_frame = std::min(target_frame, total_frames);
     }
@@ -147,8 +185,52 @@ public:
         return frames_read;
     }
 
+    // 512샘플 AI 분리 스템 읽기 (동일 재생 헤드로 완벽 동기화)
+    size_t read_frames_stems(float* v_out, float* b_out, float* i_out, size_t num_frames) {
+        if (!m_is_playing || !m_has_ai_stems.load() || m_samples_vocal.empty()) {
+            std::fill(v_out, v_out + num_frames * 2, 0.0f);
+            std::fill(b_out, b_out + num_frames * 2, 0.0f);
+            std::fill(i_out, i_out + num_frames * 2, 0.0f);
+            return 0;
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t total_frames = m_samples_vocal.size() / 2;
+        size_t frames_read = 0;
+
+        for (size_t i = 0; i < num_frames; ++i) {
+            if (m_current_frame >= total_frames) {
+                if (m_loop) {
+                    m_current_frame = 0;
+                } else {
+                    m_is_playing = false;
+                    for (size_t k = i; k < num_frames; ++k) {
+                        v_out[k * 2]     = 0.0f; v_out[k * 2 + 1] = 0.0f;
+                        b_out[k * 2]     = 0.0f; b_out[k * 2 + 1] = 0.0f;
+                        i_out[k * 2]     = 0.0f; i_out[k * 2 + 1] = 0.0f;
+                    }
+                    return frames_read;
+                }
+            }
+
+            v_out[i * 2]     = m_samples_vocal[m_current_frame * 2];
+            v_out[i * 2 + 1] = m_samples_vocal[m_current_frame * 2 + 1];
+
+            b_out[i * 2]     = m_samples_beat[m_current_frame * 2];
+            b_out[i * 2 + 1] = m_samples_beat[m_current_frame * 2 + 1];
+
+            i_out[i * 2]     = m_samples_inst[m_current_frame * 2];
+            i_out[i * 2 + 1] = m_samples_inst[m_current_frame * 2 + 1];
+
+            m_current_frame++;
+            frames_read++;
+        }
+
+        return frames_read;
+    }
+
     bool is_loaded() const {
-        return !m_samples.empty();
+        return !m_samples.empty() || (m_has_ai_stems.load() && !m_samples_vocal.empty());
     }
 
     bool is_playing() const {
@@ -156,6 +238,9 @@ public:
     }
 
     float get_duration_seconds() const {
+        if (m_has_ai_stems.load() && !m_samples_vocal.empty()) {
+            return static_cast<float>(m_samples_vocal.size() / 2) / m_target_sample_rate;
+        }
         if (m_samples.empty()) return 0.0f;
         return static_cast<float>(m_samples.size() / 2) / m_target_sample_rate;
     }
@@ -269,12 +354,25 @@ private:
     std::wstring m_file_path;
     std::wstring m_file_name;
     std::vector<float> m_samples; // 44.1kHz Stereo interleaved
+    std::vector<float> m_samples_vocal; // Demucs AI Vocal Stem
+    std::vector<float> m_samples_beat;  // Demucs AI Beat/Drums Stem
+    std::vector<float> m_samples_inst;  // Demucs AI Inst/Bass Stem
+    std::atomic<bool> m_has_ai_stems{false};
     size_t m_current_frame;
     std::atomic<bool> m_is_playing;
     bool m_loop;
     std::mutex m_mutex;
 
-    bool load_via_media_foundation(const std::wstring& filePath) {
+    bool load_audio_data(const std::wstring& filePath, std::vector<float>& out_samples) {
+        out_samples.clear();
+        bool success = load_via_media_foundation(filePath, out_samples);
+        if (!success) {
+            success = load_via_direct_wav(filePath, out_samples);
+        }
+        return success && !out_samples.empty();
+    }
+
+    bool load_via_media_foundation(const std::wstring& filePath, std::vector<float>& out_samples) {
         HRESULT hr = MFStartup(MF_VERSION);
         if (FAILED(hr)) return false;
 
@@ -302,7 +400,7 @@ private:
             return false;
         }
 
-        m_samples.clear();
+        out_samples.clear();
 
         while (true) {
             DWORD flags = 0;
@@ -329,7 +427,7 @@ private:
                     if (SUCCEEDED(hr)) {
                         size_t floatCount = cbCurrentLen / sizeof(float);
                         const float* fData = reinterpret_cast<const float*>(pData);
-                        m_samples.insert(m_samples.end(), fData, fData + floatCount);
+                        out_samples.insert(out_samples.end(), fData, fData + floatCount);
                         pBuffer->Unlock();
                     }
                     pBuffer->Release();
@@ -340,10 +438,10 @@ private:
 
         pReader->Release();
         MFShutdown();
-        return !m_samples.empty();
+        return !out_samples.empty();
     }
 
-    bool load_via_direct_wav(const std::wstring& filePath) {
+    bool load_via_direct_wav(const std::wstring& filePath, std::vector<float>& out_samples) {
         FILE* fp = nullptr;
         _wfopen_s(&fp, filePath.c_str(), L"rb");
         if (!fp) return false;
@@ -360,23 +458,23 @@ private:
         }
 
         size_t num_samples = hdr.data_size / (hdr.bits_per_sample / 8);
-        m_samples.resize(num_samples);
+        out_samples.resize(num_samples);
 
         if (hdr.bits_per_sample == 16) {
             std::vector<int16_t> raw(num_samples);
             fread(raw.data(), sizeof(int16_t), num_samples, fp);
             for (size_t i = 0; i < num_samples; ++i) {
-                m_samples[i] = raw[i] / 32768.0f;
+                out_samples[i] = raw[i] / 32768.0f;
             }
         } else if (hdr.bits_per_sample == 32) {
-            fread(m_samples.data(), sizeof(float), num_samples, fp);
+            fread(out_samples.data(), sizeof(float), num_samples, fp);
         } else {
             fclose(fp);
             return false;
         }
 
         fclose(fp);
-        return !m_samples.empty();
+        return !out_samples.empty();
     }
 };
 

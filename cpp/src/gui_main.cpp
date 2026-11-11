@@ -128,6 +128,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // 5. 음원 파일 로드 및 스템 파일 일괄 내보내기 콜백
     std::atomic<bool> use_audio_file(false);
+    std::atomic<bool> is_demucs_running(false);
 
     gui_window.set_file_open_callback([&](const std::wstring& path) {
         bool ok = file_player.load_file(path);
@@ -135,10 +136,129 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             file_player.play();
             use_audio_file.store(true);
             gui_window.refresh_devices_with_file();
-            gui_window.show_toast("Music Loaded! Playing & Separating: Vocal->CH1, Beat->CH2, Inst->CH4", 4.0f);
+
+            // AI 스템이 이미 존재하는지 확인 (예: demucs_stems 폴더 또는 동일 폴더)
+            size_t slash = path.find_last_of(L"\\/");
+            std::wstring dir = (slash != std::wstring::npos) ? path.substr(0, slash) : L".";
+            size_t dot = path.find_last_of(L".");
+            std::wstring base_name = (dot != std::wstring::npos && dot > slash)
+                                   ? path.substr(slash + 1, dot - slash - 1)
+                                   : path.substr(slash + 1);
+
+            std::wstring demucs_dir = dir + L"\\demucs_stems";
+            std::wstring v1 = demucs_dir + L"\\" + base_name + L"_vocal.wav";
+            std::wstring b1 = demucs_dir + L"\\" + base_name + L"_beat.wav";
+            std::wstring i1 = demucs_dir + L"\\" + base_name + L"_inst.wav";
+
+            std::wstring v2 = dir + L"\\" + base_name + L"_vocal.wav";
+            std::wstring b2 = dir + L"\\" + base_name + L"_beat.wav";
+            std::wstring i2 = dir + L"\\" + base_name + L"_inst.wav";
+
+            bool loaded_ai = false;
+            if (GetFileAttributesW(v1.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesW(b1.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesW(i1.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                loaded_ai = file_player.load_ai_stems(v1, b1, i1);
+            } else if (GetFileAttributesW(v2.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                       GetFileAttributesW(b2.c_str()) != INVALID_FILE_ATTRIBUTES &&
+                       GetFileAttributesW(i2.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                loaded_ai = file_player.load_ai_stems(v2, b2, i2);
+            }
+
+            if (loaded_ai) {
+                gui_window.show_toast("기존 AI 분리 스템이 발견되어 자동 로드되었습니다! (Demucs)", 4.0f);
+            } else {
+                gui_window.show_toast("음원 로드 완료! (실시간 STFT 모드 / AI 분리 버튼 클릭 가능)", 4.0f);
+            }
         } else {
             gui_window.show_toast("Failed to load audio file! (Format unsupported)", 3.0f);
         }
+    });
+
+    gui_window.set_ai_separate_callback([&]() {
+        if (!file_player.is_loaded()) {
+            gui_window.show_toast("음원 파일을 먼저 불러와주세요!", 3.0f);
+            return;
+        }
+
+        if (is_demucs_running.load()) {
+            gui_window.show_toast("AI 스템 분리가 이미 진행 중입니다. 잠시만 기다려주세요...", 3.0f);
+            return;
+        }
+
+        std::thread([&]() {
+            is_demucs_running.store(true);
+            gui_window.show_toast("🤖 Demucs AI 분리 시작... (약 10~15초 소요, 음악 재생은 유지됩니다)", 10.0f);
+
+            std::wstring in_path = file_player.get_file_path();
+            size_t slash = in_path.find_last_of(L"\\/");
+            std::wstring dir = (slash != std::wstring::npos) ? in_path.substr(0, slash) : L".";
+            size_t dot = in_path.find_last_of(L".");
+            std::wstring base_name = (dot != std::wstring::npos && dot > slash)
+                                   ? in_path.substr(slash + 1, dot - slash - 1)
+                                   : in_path.substr(slash + 1);
+
+            std::wstring out_dir = dir + L"\\demucs_stems";
+
+            // demucs_runner.py 스크립트 경로 탐색
+            std::wstring script_path = L"scripts\\demucs_runner.py";
+            if (GetFileAttributesW(script_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                script_path = L"..\\scripts\\demucs_runner.py";
+            }
+
+            // python "scripts\demucs_runner.py" "<in_path>" "<out_dir>"
+            std::wstring cmd = L"python \"" + script_path + L"\" \"" + in_path + L"\" \"" + out_dir + L"\"";
+
+            STARTUPINFOW si = { sizeof(si) };
+            PROCESS_INFORMATION pi = { 0 };
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+
+            std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+            cmd_buf.push_back(L'\0');
+
+            BOOL created = CreateProcessW(
+                nullptr,
+                cmd_buf.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &si,
+                &pi
+            );
+
+            bool success = false;
+            if (created) {
+                WaitForSingleObject(pi.hProcess, 180000); // 최대 3분 대기
+                DWORD exit_code = 1;
+                GetExitCodeProcess(pi.hProcess, &exit_code);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                if (exit_code == 0) {
+                    success = true;
+                }
+            }
+
+            if (success) {
+                std::wstring v_path = out_dir + L"\\" + base_name + L"_vocal.wav";
+                std::wstring b_path = out_dir + L"\\" + base_name + L"_beat.wav";
+                std::wstring i_path = out_dir + L"\\" + base_name + L"_inst.wav";
+
+                bool loaded = file_player.load_ai_stems(v_path, b_path, i_path);
+                if (loaded) {
+                    gui_window.show_toast("🎉 Demucs AI 스템 분리 완료! 스튜디오급 음원이 적용되었습니다.", 5.0f);
+                } else {
+                    gui_window.show_toast("❌ AI 스템 파일 로드 실패 (파일 손상 또는 미생성)", 4.0f);
+                }
+            } else {
+                gui_window.show_toast("❌ Demucs 실행 실패. Python 환경 및 demucs 패키지를 확인하세요.", 5.0f);
+            }
+
+            is_demucs_running.store(false);
+        }).detach();
     });
 
     gui_window.set_file_export_callback([&]() {
@@ -343,10 +463,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
             // --- C. 스템 분리 (S-FR-4) ---
             if (is_file_active) {
-                // 음원 파일에서 512샘플 읽기
-                file_player.read_frames(file_block.data(), block_size);
-                // 실시간 3-Way 스템 분리: 보컬(Vocal) -> vocal_buf, 비트(Beat) -> beat_buf, 악기(Inst) -> inst_buf
-                stem_separator.process(file_block.data(), vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+                if (file_player.has_ai_stems()) {
+                    // Demucs AI 사전 분리 스템 완벽 동기화 재생
+                    file_player.read_frames_stems(vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+                    for (size_t i = 0; i < block_size * 2; ++i) {
+                        file_block[i] = vocal_buf[i] + beat_buf[i] + inst_buf[i];
+                    }
+                } else {
+                    // 실시간 STFT 분리 (COLA 50% Overlap-Add)
+                    file_player.read_frames(file_block.data(), block_size);
+                    stem_separator.process(file_block.data(), vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+                }
             } else {
                 stem_separator.process(in_block.data(), vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
 

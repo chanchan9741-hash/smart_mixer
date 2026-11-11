@@ -179,6 +179,48 @@ void test_stem_separation_and_export() {
     std::cout << " PASSED (3 Stems Separated & Export Verified)\n";
 }
 
+void test_ai_stems_playback() {
+    std::cout << "[Test 8] AudioFilePlayer (Demucs AI Stems Multi-Track)...";
+    AudioFilePlayer player(44100);
+
+    // 3개 인공 스템 생성 (512 프레임 스테레오)
+    std::vector<float> v_samples(512 * 2, 0.4f);
+    std::vector<float> b_samples(512 * 2, 0.6f);
+    std::vector<float> i_samples(512 * 2, 0.2f);
+
+    std::wstring v_path = L"temp_ai_vocal.wav";
+    std::wstring b_path = L"temp_ai_beat.wav";
+    std::wstring i_path = L"temp_ai_inst.wav";
+
+    assert(AudioFilePlayer::write_wav_file(v_path, v_samples, 44100));
+    assert(AudioFilePlayer::write_wav_file(b_path, b_samples, 44100));
+    assert(AudioFilePlayer::write_wav_file(i_path, i_samples, 44100));
+
+    bool loaded = player.load_ai_stems(v_path, b_path, i_path);
+    assert(loaded);
+    assert(player.has_ai_stems());
+    assert(player.is_loaded());
+
+    player.play();
+    assert(player.is_playing());
+
+    std::vector<float> v_out(512 * 2, 0.0f);
+    std::vector<float> b_out(512 * 2, 0.0f);
+    std::vector<float> i_out(512 * 2, 0.0f);
+
+    size_t read_cnt = player.read_frames_stems(v_out.data(), b_out.data(), i_out.data(), 512);
+    assert(read_cnt == 512);
+    assert(std::abs(v_out[0] - 0.4f) < 0.01f);
+    assert(std::abs(b_out[0] - 0.6f) < 0.01f);
+    assert(std::abs(i_out[0] - 0.2f) < 0.01f);
+
+    _wremove(v_path.c_str());
+    _wremove(b_path.c_str());
+    _wremove(i_path.c_str());
+
+    std::cout << " PASSED (3 Stems Synchronized Read Verified)\n";
+}
+
 int main() {
     std::cout << "\n=== Running C++ Core Unit Tests ===\n";
     test_ring_buffer();
@@ -188,7 +230,8 @@ int main() {
     test_button_debouncer();
     test_mixer_gain_ramp();
     test_stem_separation_and_export();
-    std::cout << "=== All 7 C++ Tests Passed Successfully! ===\n\n";
+    test_ai_stems_playback();
+    std::cout << "=== All 8 C++ Tests Passed Successfully! ===\n\n";
     return 0;
 }
 
