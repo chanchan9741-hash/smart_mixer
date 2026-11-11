@@ -70,6 +70,14 @@ public:
                 a1 = -2.0f * cos_w0;
                 a2 = 1.0f - alpha;
                 break;
+            case FilterType::Lowpass:
+                b0 = (1.0f - cos_w0) * 0.5f;
+                b1 = 1.0f - cos_w0;
+                b2 = (1.0f - cos_w0) * 0.5f;
+                a0 = 1.0f + alpha;
+                a1 = -2.0f * cos_w0;
+                a2 = 1.0f - alpha;
+                break;
             default:
                 break;
         }
@@ -79,6 +87,18 @@ public:
         m_b2 = b2 / a0;
         m_a1 = a1 / a0;
         m_a2 = a2 / a0;
+    }
+
+    // 단일 샘플 (모노) 필터링
+    float process_sample(float x) {
+        float y = m_b0 * x + m_z1_l;
+        m_z1_l = m_b1 * x - m_a1 * y + m_z2_l;
+        m_z2_l = m_b2 * x - m_a2 * y;
+        return y;
+    }
+
+    void reset() {
+        m_z1_l = m_z2_l = m_z1_r = m_z2_r = 0.0f;
     }
 
     // Direct Form II Transposed 스테레오 블록 필터링
@@ -101,11 +121,6 @@ public:
     }
 
     float get_freq() const { return m_freq; }
-
-    void reset() {
-        m_z1_l = m_z2_l = 0.0f;
-        m_z1_r = m_z2_r = 0.0f;
-    }
 
 private:
     FilterType m_type;

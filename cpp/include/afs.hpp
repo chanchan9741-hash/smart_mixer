@@ -46,6 +46,14 @@ public:
             }
         }
     }
+
+    static void ifft(std::vector<std::complex<float>>& a) {
+        size_t n = a.size();
+        for (size_t i = 0; i < n; ++i) a[i] = std::conj(a[i]);
+        fft(a);
+        float inv_n = 1.0f / n;
+        for (size_t i = 0; i < n; ++i) a[i] = std::conj(a[i]) * inv_n;
+    }
 };
 
 class FeedbackDetector {

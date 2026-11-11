@@ -300,11 +300,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
 
             // --- B. 보컬(Vocal) 마이크 입력 획득 ---
+            bool is_file_active = (use_audio_file.load() && file_player.is_playing());
+
             if (use_real_mic.load()) {
                 // 실제 마이크 스트림에서 보컬 오디오 획득
                 mic_ring_buffer.read(in_block.data(), block_size);
-            } else {
-                // 가상 보컬 신호 생성 (음성 기본 주파수 440Hz 및 배음)
+            } else if (!is_file_active) {
+                // 음악 파일이 재생 중이지 않을 때만 가상 보컬 신호 생성 (음성 기본 주파수 440Hz 및 배음)
                 for (size_t i = 0; i < block_size; ++i) {
                     float sample = 0.08f * std::sin(2.0f * PI * 440.0f * t)
                                  + 0.03f * std::sin(2.0f * PI * 880.0f * t);
@@ -312,6 +314,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     in_block[i * 2] = sample;
                     in_block[i * 2 + 1] = sample;
                 }
+            } else {
+                // 음악 파일 재생 중이고 마이크가 연결되지 않았으면 CH3(Mic) 채널은 무음(0) 처리
+                std::fill(in_block.begin(), in_block.end(), 0.0f);
             }
 
             // 하울링 주입 테스트 활성화 시 피드백 정현파 가산
@@ -332,9 +337,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
             }
 
-            // --- C. 스템 분리 (S-FR-4) ---
-            bool is_file_active = (use_audio_file.load() && file_player.is_playing());
+            // --- B-2. AFS 하울링 자동 억제 (마이크 입력 채널에 적용) ---
+            // 마이크 하울링 억제를 마이크 입력단에 적용하여 음악 원본 음질(노치 필터로 인한 먹먹함)을 100% 보존
+            afs->process(in_block.data(), block_size);
 
+            // --- C. 스템 분리 (S-FR-4) ---
             if (is_file_active) {
                 // 음원 파일에서 512샘플 읽기
                 file_player.read_frames(file_block.data(), block_size);
@@ -390,9 +397,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
             // 믹싱 합산
             mixer.mix(mixer_inputs, mixed_out.data(), block_size);
-
-            // --- E. AFS 하울링 자동 억제 (S-FR-3) ---
-            afs->process(mixed_out.data(), block_size);
 
             // --- F. 라우드니스 매치 & 피크 리미터 (S-FR-5) ---
             loudness.process(mixed_out.data(), block_size);
