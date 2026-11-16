@@ -19,11 +19,17 @@
 #include <iomanip>
 #include <mutex>
 #include <array>
+#include <functional>
 
 #include "hardware_ipc.hpp"
 #include "hardware_audio_synth.hpp"
+#include "wasapi_capture.hpp"
+#include "wasapi_render.hpp"
 
 namespace SmartMixer {
+
+constexpr int IDC_HW_MIC_COMBO = 2001;
+constexpr int IDC_HW_SPK_COMBO = 2002;
 
 struct RawHwInputs {
     uint16_t fader_adc[5];
@@ -44,17 +50,32 @@ struct McuUiTelemetry {
     float measured_lufs = -70.0f;
     float target_lufs = -14.0f;
     float eq_db[3] = { 0.0f, 0.0f, 0.0f };
+    float mic_rms = 0.0f;
+    float out_peak_l = 0.0f;
+    float out_peak_r = 0.0f;
+    float spk_wave[32] = { 0.0f };
     bool pc_host_linked = false;
     bool howling_alert = false;
 };
 
 class HardwareSimWindow {
 public:
-    HardwareSimWindow(HINSTANCE hInstance, HardwareAudioSynthesizer& synth, HardwareIpcSocket& ipc)
+    using SelectCallback = std::function<void(int)>;
+    using ActionCallback = std::function<void()>;
+
+    HardwareSimWindow(HINSTANCE hInstance,
+                      HardwareAudioSynthesizer& synth,
+                      HardwareIpcSocket& ipc,
+                      WasapiCaptureEngine& mic_cap,
+                      WasapiRenderEngine& spk_render)
         : m_hInstance(hInstance),
           m_hWnd(nullptr),
+          m_hComboMic(nullptr),
+          m_hComboSpk(nullptr),
           m_synth(synth),
           m_ipc(ipc),
+          m_mic_cap(mic_cap),
+          m_spk_render(spk_render),
           m_dragging_fader(-1),
           m_dragging_eq(-1),
           m_eq_drag_start_y(0),
@@ -70,6 +91,10 @@ public:
         m_btn_pressed.fill(false);
         m_oled_buffer.resize(1024, 0);
     }
+
+    void set_mic_selected_callback(SelectCallback cb) { m_mic_selected_cb = std::move(cb); }
+    void set_spk_selected_callback(SelectCallback cb) { m_spk_selected_cb = std::move(cb); }
+    void set_howl_inject_callback(ActionCallback cb) { m_howl_inject_cb = std::move(cb); }
 
     RawHwInputs snapshot_inputs() {
         std::lock_guard<std::mutex> lock(m_mtx);
@@ -154,6 +179,33 @@ public:
 
         if (!m_hWnd) return false;
 
+        // 기기 전용 마이크 입력 선택 콤보박스 (x: 472, y: 472, w: 208, h: 180)
+        m_hComboMic = CreateWindowExW(
+            0, L"COMBOBOX", L"",
+            CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
+            472, 472, 208, 180,
+            m_hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_HW_MIC_COMBO)),
+            m_hInstance, nullptr
+        );
+
+        // 기기 가상 스피커 / 출력 브릿지 선택 콤보박스 (x: 714, y: 472, w: 208, h: 180)
+        m_hComboSpk = CreateWindowExW(
+            0, L"COMBOBOX", L"",
+            CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
+            714, 472, 208, 180,
+            m_hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_HW_SPK_COMBO)),
+            m_hInstance, nullptr
+        );
+
+        HFONT hComboFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                       DEFAULT_PITCH, L"Segoe UI");
+        if (m_hComboMic) SendMessageW(m_hComboMic, WM_SETFONT, reinterpret_cast<WPARAM>(hComboFont), TRUE);
+        if (m_hComboSpk) SendMessageW(m_hComboSpk, WM_SETFONT, reinterpret_cast<WPARAM>(hComboFont), TRUE);
+
+        populate_hw_mic_combo();
+        populate_hw_spk_combo();
+
         // 60 FPS 렌더링 타이머
         SetTimer(m_hWnd, 1, 16, nullptr);
         return true;
@@ -164,9 +216,41 @@ public:
 private:
     HINSTANCE m_hInstance;
     HWND m_hWnd;
+    HWND m_hComboMic;
+    HWND m_hComboSpk;
     HardwareAudioSynthesizer& m_synth;
     HardwareIpcSocket& m_ipc;
+    WasapiCaptureEngine& m_mic_cap;
+    WasapiRenderEngine& m_spk_render;
+    SelectCallback m_mic_selected_cb;
+    SelectCallback m_spk_selected_cb;
+    ActionCallback m_howl_inject_cb;
     mutable std::mutex m_mtx;
+
+    void populate_hw_mic_combo() {
+        if (!m_hComboMic) return;
+        SendMessageW(m_hComboMic, CB_RESETCONTENT, 0, 0);
+        SendMessageW(m_hComboMic, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"💻 [가상 보컬] Virtual Mic (440Hz)"));
+        SendMessageW(m_hComboMic, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"🔇 [무음] Mic Mute"));
+        auto devs = m_mic_cap.enumerate_capture_devices();
+        for (const auto& d : devs) {
+            std::wstring label = L"🎤 " + d.name_wide;
+            SendMessageW(m_hComboMic, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        SendMessageW(m_hComboMic, CB_SETCURSEL, 0, 0);
+    }
+
+    void populate_hw_spk_combo() {
+        if (!m_hComboSpk) return;
+        SendMessageW(m_hComboSpk, CB_RESETCONTENT, 0, 0);
+        SendMessageW(m_hComboSpk, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"🔌 가상 스피커 → PC 입력 브릿지 (기본)"));
+        auto devs = m_spk_render.enumerate_render_devices();
+        for (const auto& d : devs) {
+            std::wstring label = L"🔊 [직접 모니터] " + d.name_wide;
+            SendMessageW(m_hComboSpk, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        SendMessageW(m_hComboSpk, CB_SETCURSEL, 0, 0);
+    }
 
     std::array<int, 5> m_raw_fader_adc;
     std::array<int, 5> m_display_fader_adc;
@@ -205,6 +289,19 @@ private:
 
     LRESULT handle_message(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (msg) {
+            case WM_COMMAND: {
+                if (LOWORD(wParam) == IDC_HW_MIC_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                    int sel = static_cast<int>(SendMessageW(m_hComboMic, CB_GETCURSEL, 0, 0));
+                    if (m_mic_selected_cb) m_mic_selected_cb(sel);
+                    return 0;
+                }
+                if (LOWORD(wParam) == IDC_HW_SPK_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                    int sel = static_cast<int>(SendMessageW(m_hComboSpk, CB_GETCURSEL, 0, 0));
+                    if (m_spk_selected_cb) m_spk_selected_cb(sel);
+                    return 0;
+                }
+                break;
+            }
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 HDC hdc = BeginPaint(hwnd, &ps);
@@ -334,6 +431,12 @@ private:
             m_synth.set_line2_playing(!m_synth.is_line2_playing());
             return;
         }
+
+        // 8. 기기 마이크 하울링 주입 테스트 버튼 (x: 472 ~ 680, y: 554 ~ 588)
+        if (x >= 472 && x <= 680 && y >= 554 && y <= 588) {
+            if (m_howl_inject_cb) m_howl_inject_cb();
+            return;
+        }
     }
 
     void on_rbutton_down(int x, int y) {
@@ -447,8 +550,14 @@ private:
         // 좌측 하단: 하드웨어 음원 생성기 (CH2 비트 & CH4 라인 2)
         draw_audio_sources_card(memDC);
 
-        // 우측: 5개 물리 슬라이드 페이더 (PTA 10k 슬라이더)
+        // 우측 상단: 5개 물리 슬라이드 페이더 (PTA 10k 슬라이더)
         draw_physical_faders(memDC, fader_adc_snap);
+
+        // 우측 하단 좌: 기기 전용 마이크 입력 (CH 3 MIC IN) & 하울링 테스트
+        draw_hw_mic_card(memDC, tel_snap);
+
+        // 우측 하단 우: 가상 스피커 출력 & PC 입력 브릿지
+        draw_virtual_speaker_card(memDC, tel_snap);
 
         BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
 
@@ -724,7 +833,7 @@ private:
     }
 
     void draw_physical_faders(HDC hdc, const std::array<int, 5>& fader_adc) {
-        RECT panelRc = { 460, 60, 935, 595 };
+        RECT panelRc = { 460, 60, 935, 434 };
         draw_module_card(hdc, panelRc, L"5-CHANNEL PHYSICAL SLIDE FADERS (PTA 10K LINEAR)");
 
         const wchar_t* ch_names[] = { L"CH 0 MASTER", L"CH 1 VOCAL", L"CH 2 BEAT", L"CH 3 MIC 1", L"CH 4 LINE 2" };
@@ -809,6 +918,113 @@ private:
         SelectObject(hdc, oldFont);
         DeleteObject(hFont);
         DeleteObject(hAdcFont);
+    }
+
+    void draw_hw_mic_card(HDC hdc, const McuUiTelemetry& tel) {
+        RECT panelRc = { 460, 442, 692, 600 };
+        draw_module_card(hdc, panelRc, L"🎤 HW MIC IN (CH 3 ONLY)");
+
+        HFONT hFont = CreateFontW(12, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH, L"Segoe UI");
+        HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, hFont));
+
+        // 마이크 입력 ADC 레벨 바 (y: 512 ~ 530)
+        SetTextColor(hdc, RGB(170, 175, 185));
+        RECT lblRc = { 472, 502, 680, 518 };
+        DrawTextW(hdc, L"CH 3 MIC ADC INPUT LEVEL:", -1, &lblRc, DT_LEFT | DT_SINGLELINE);
+
+        RECT trackRc = { 472, 520, 680, 536 };
+        HBRUSH trackBr = CreateSolidBrush(RGB(15, 16, 18));
+        FillRect(hdc, &trackRc, trackBr);
+        DeleteObject(trackBr);
+
+        float lvl = std::clamp(tel.mic_rms * 2.5f, 0.0f, 1.0f);
+        int fill_w = static_cast<int>(lvl * (trackRc.right - trackRc.left));
+        if (fill_w > 0) {
+            RECT fillRc = { trackRc.left, trackRc.top, trackRc.left + fill_w, trackRc.bottom };
+            COLORREF col = (lvl > 0.8f) ? RGB(255, 60, 60) : ((lvl > 0.45f) ? RGB(255, 187, 0) : RGB(57, 255, 20));
+            HBRUSH fBr = CreateSolidBrush(col);
+            FillRect(hdc, &fillRc, fBr);
+            DeleteObject(fBr);
+        }
+
+        // 2.5kHz 하울링 주입 테스트 버튼 (y: 554 ~ 588)
+        RECT howlRc = { 472, 554, 680, 588 };
+        HBRUSH hBr = CreateSolidBrush(RGB(115, 32, 32));
+        FillRect(hdc, &howlRc, hBr);
+        DeleteObject(hBr);
+        SetTextColor(hdc, RGB(255, 225, 225));
+        DrawTextW(hdc, L"⚡ 2.5kHz 기기 하울링 주입", -1, &howlRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(hdc, oldFont);
+        DeleteObject(hFont);
+    }
+
+    void draw_virtual_speaker_card(HDC hdc, const McuUiTelemetry& tel) {
+        RECT panelRc = { 702, 442, 935, 600 };
+        draw_module_card(hdc, panelRc, L"🔊 VIRTUAL SPEAKER -> PC IN");
+
+        HFONT hFont = CreateFontW(11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH, L"Segoe UI");
+        HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, hFont));
+
+        // 32-샘플 실시간 가상 스피커 출력 파형 박스 (y: 504 ~ 544)
+        RECT waveRc = { 714, 504, 922, 544 };
+        HBRUSH wBr = CreateSolidBrush(RGB(10, 14, 18));
+        FillRect(hdc, &waveRc, wBr);
+        DeleteObject(wBr);
+
+        int mid_y = (waveRc.top + waveRc.bottom) / 2;
+        HPEN midPen = CreatePen(PS_SOLID, 1, RGB(35, 45, 55));
+        HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, midPen));
+        MoveToEx(hdc, waveRc.left, mid_y, nullptr);
+        LineTo(hdc, waveRc.right, mid_y);
+        DeleteObject(midPen);
+
+        HPEN wavePen = CreatePen(PS_SOLID, 2, RGB(0, 220, 255));
+        SelectObject(hdc, wavePen);
+        int w_span = waveRc.right - waveRc.left;
+        for (int i = 0; i < 32; ++i) {
+            int x = waveRc.left + (i * w_span) / 31;
+            int y = mid_y - static_cast<int>(std::clamp(tel.spk_wave[i], -1.0f, 1.0f) * 18.0f);
+            if (i == 0) MoveToEx(hdc, x, y, nullptr);
+            else        LineTo(hdc, x, y);
+        }
+        SelectObject(hdc, oldPen);
+        DeleteObject(wavePen);
+
+        // L / R 스테레오 가상 스피커 아웃풋 미터 (y: 550 ~ 568)
+        float peaks[2] = { std::clamp(tel.out_peak_l * 1.4f, 0.0f, 1.0f),
+                           std::clamp(tel.out_peak_r * 1.4f, 0.0f, 1.0f) };
+        for (int ch = 0; ch < 2; ++ch) {
+            int y0 = 550 + ch * 9;
+            RECT bg = { 732, y0, 922, y0 + 6 };
+            HBRUSH bgB = CreateSolidBrush(RGB(20, 24, 28));
+            FillRect(hdc, &bg, bgB);
+            DeleteObject(bgB);
+
+            SetTextColor(hdc, RGB(170, 175, 185));
+            RECT chTxt = { 714, y0 - 3, 730, y0 + 9 };
+            DrawTextW(hdc, ch == 0 ? L"L" : L"R", -1, &chTxt, DT_LEFT | DT_SINGLELINE);
+
+            int fw = static_cast<int>(peaks[ch] * (bg.right - bg.left));
+            if (fw > 0) {
+                RECT fg = { bg.left, bg.top, bg.left + fw, bg.bottom };
+                HBRUSH fgB = CreateSolidBrush(RGB(0, 210, 255));
+                FillRect(hdc, &fg, fgB);
+                DeleteObject(fgB);
+            }
+        }
+
+        // 상태 표시줄
+        SetTextColor(hdc, tel.pc_host_linked ? RGB(57, 255, 20) : RGB(0, 210, 255));
+        RECT stRc = { 714, 574, 924, 594 };
+        DrawTextW(hdc, L"● Virtual Speaker Out -> PC Software Input", -1, &stRc, DT_LEFT | DT_SINGLELINE);
+
+        SelectObject(hdc, oldFont);
+        DeleteObject(hFont);
     }
 
     void draw_module_card(HDC hdc, const RECT& rc, const wchar_t* title) {

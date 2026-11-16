@@ -276,22 +276,16 @@ private:
 
     void populate_input_devices() {
         if (!m_hComboInput) return;
+        (void)m_wasapi;
 
         SendMessageW(m_hComboInput, CB_RESETCONTENT, 0, 0);
 
-        // 0번: 가상 오디오 신호 생성기
-        SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"💻 [가상 신호] Virtual Generator"));
+        // 0번: 기기(STM32 하드웨어 시뮬레이터) 가상 스피커 -> PC 소프트웨어 입력
+        SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"🎛️ [기기 가상 스피커] STM32 HW Audio In"));
 
-        // 1번 ~ N번: 실제 감지된 WASAPI 입력 장치들
-        auto devices = m_wasapi.enumerate_capture_devices();
-        for (const auto& dev : devices) {
-            std::wstring item_label = L"🎤 " + dev.name_wide;
-            SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str()));
-        }
-
-        // 음원 파일이 로드되어 있는 경우 파일 재생 옵션 추가
+        // 1번: 음원 파일이 로드되어 있는 경우 파일 재생 + 기기 마이크 믹싱 옵션 추가
         if (m_file_player.is_loaded()) {
-            std::wstring item_label = L"🎵 [음원] " + m_file_player.get_file_name();
+            std::wstring item_label = L"🎵 [음원 + 기기 마이크] " + m_file_player.get_file_name();
             int idx = static_cast<int>(SendMessageW(m_hComboInput, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item_label.c_str())));
             SendMessageW(m_hComboInput, CB_SETCURSEL, idx, 0);
         } else {
@@ -643,7 +637,7 @@ private:
         SelectObject(hdc, hLabelFont);
 
         SetTextColor(hdc, RGB(0, 210, 255));
-        TextOutW(hdc, 192, 17, L"🎤 입력:", 5);
+        TextOutW(hdc, 188, 17, L"🔌 PC입력:", 6);
 
         SetTextColor(hdc, RGB(57, 255, 20));
         TextOutW(hdc, 552, 17, L"🔊 출력:", 5);

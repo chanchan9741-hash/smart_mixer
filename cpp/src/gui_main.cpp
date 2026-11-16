@@ -127,16 +127,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     });
 
     // 하울링 강제 주입 및 필터 리셋 콜백
-    std::atomic<bool> inject_howling(false);
-    std::atomic<size_t> howl_samples_remaining(0);
-    float howl_phase = 0.0f;
-    float howl_freq = 2500.0f;
-
     gui_window.set_inject_howling_callback([&]() {
-        howl_freq = 2500.0f;
-        howl_samples_remaining.store(static_cast<size_t>(config.audio.sample_rate * 0.8f));
-        howl_phase = 0.0f;
-        inject_howling.store(true);
+        send_sim_vcp("[INJECT_HOWL]\n");
+        gui_window.show_toast("⚡ 기기 마이크 입력단에 2.5kHz 하울링 신호 주입!", 2.5f);
     });
 
     gui_window.set_reset_filters_callback([&]() {
@@ -403,39 +396,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }).detach();
     });
 
-    // 6. 입력 장치 전환 핸들러 (WASAPI 실시간 마이크 vs 가상 신호 vs 음원 파일)
-    std::atomic<bool> use_real_mic(false);
-    AudioRingBuffer mic_ring_buffer(16384, 2);
+    // 6. PC 입력 소스 전환 핸들러 (기기 가상 스피커 입력 vs 음원 AI 스템 송출)
+    // 마이크(CH 3) 입력은 하드웨어 기기(hardware_sim_gui)에서만 전담합니다.
+    wasapi.stop();
 
     gui_window.set_device_selected_callback([&](int sel) {
-        auto devices = wasapi.enumerate_capture_devices();
         if (sel == 0) {
-            wasapi.stop();
-            mic_ring_buffer.clear();
-            use_real_mic.store(false);
             use_audio_file.store(false);
             file_player.pause();
-            gui_window.show_toast("Switched to Virtual Vocal Generator", 2.0f);
-        } else if (file_player.is_loaded() && sel == static_cast<int>(devices.size() + 1)) {
+            gui_window.show_toast("PC 입력: STM32 기기 가상 스피커 스트림 수신", 2.5f);
+        } else if (file_player.is_loaded() && sel == 1) {
             use_audio_file.store(true);
             file_player.play();
-            gui_window.show_toast("Switched to Music Track Player", 2.0f);
-        } else {
-            use_audio_file.store(false);
-            file_player.pause();
-            int dev_idx = sel - 1;
-            mic_ring_buffer.clear();
-            bool ok = wasapi.start_device(dev_idx, [&](const float* data, size_t frames) {
-                mic_ring_buffer.write(data, frames);
-            });
-
-            if (ok) {
-                use_real_mic.store(true);
-                gui_window.show_toast("Vocal Microphone Connected (WASAPI Real-Time Input)", 3.0f);
-            } else {
-                use_real_mic.store(false);
-                gui_window.show_toast("Failed to open microphone, reverting to Virtual mode", 3.0f);
-            }
+            gui_window.show_toast("음원(HTDemucs) -> 기기 전송 + 기기 마이크 믹싱", 2.5f);
         }
     });
 
@@ -508,18 +481,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
         size_t block_size = config.audio.block_size;
-        int sample_rate = config.audio.sample_rate;
-        float dt = 1.0f / sample_rate;
-        float t = 0.0f;
-        constexpr float PI = 3.14159265358979323846f;
 
-        std::vector<float> in_block(block_size * 2);
-        std::vector<float> vocal_buf(block_size * 2);
-        std::vector<float> beat_buf(block_size * 2);
-        std::vector<float> inst_buf(block_size * 2);
-        std::vector<float> line2_buf(block_size * 2);
+        std::vector<float> in_block(block_size * 2, 0.0f);
+        std::vector<float> vocal_buf(block_size * 2, 0.0f);
+        std::vector<float> beat_buf(block_size * 2, 0.0f);
+        std::vector<float> inst_buf(block_size * 2, 0.0f);
+        std::vector<float> line2_buf(block_size * 2, 0.0f);
         std::vector<float> file_block(block_size * 2, 0.0f);
-        std::vector<float> mixed_out(block_size * 2);
+        std::vector<float> mixed_out(block_size * 2, 0.0f);
         std::vector<float> vu_levels(5, 0.0f);
 
         std::vector<uint8_t> ipc_rx_buf(16384);
@@ -530,9 +499,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         bool last_led_stem = stem_separator.is_enabled();
         bool last_led_loud = loudness.is_enabled();
         float last_target_lufs = loudness.get_target_lufs();
+        bool was_file_active = false;
         auto last_hw_sim_tp = std::chrono::steady_clock::now() - std::chrono::seconds(2);
 
-        auto handle_sim_rx_packet = [&](const uint8_t* data, int bytes, bool& got_mixed, HwMixedAudioPacket& out_mixed) {
+        auto push_stems_to_device = [&]() {
+            if (!file_player.has_ai_stems()) return;
+            file_player.read_frames_stems(vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+            host_audio_pkt.packet_type = PKT_TYPE_HOST_AUDIO_BLOCK;
+            host_audio_pkt.use_external_stems = 1;
+            host_audio_pkt.num_frames = static_cast<uint16_t>(block_size);
+            for (size_t i = 0; i < block_size * 2; ++i) {
+                host_audio_pkt.mic_i16[i]   = 0; // 마이크 입력은 오직 기기(hardware_sim_gui)에서만 수신
+                host_audio_pkt.vocal_i16[i] = static_cast<int16_t>(std::clamp(vocal_buf[i], -1.0f, 1.0f) * 32767.0f);
+                host_audio_pkt.beat_i16[i]  = static_cast<int16_t>(std::clamp(beat_buf[i], -1.0f, 1.0f) * 32767.0f);
+                host_audio_pkt.inst_i16[i]  = static_cast<int16_t>(std::clamp(inst_buf[i], -1.0f, 1.0f) * 32767.0f);
+            }
+            mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &host_audio_pkt, sizeof(host_audio_pkt));
+        };
+
+        auto handle_sim_rx_packet = [&](const uint8_t* data, int bytes, std::vector<HwMixedAudioPacket>& out_packets) {
             if (bytes <= 0) return;
             uint8_t pkt_type = data[0];
             if (pkt_type == PKT_TYPE_VCP_COMMAND && bytes >= static_cast<int>(sizeof(uint8_t) + sizeof(uint16_t))) {
@@ -564,42 +549,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
                 }
             } else if (pkt_type == PKT_TYPE_HW_MIXED_AUDIO && bytes >= static_cast<int>(sizeof(HwMixedAudioPacket))) {
-                std::memcpy(&out_mixed, data, sizeof(HwMixedAudioPacket));
-                got_mixed = true;
-            } else if (pkt_type == PKT_TYPE_CONTROL && bytes >= static_cast<int>(sizeof(ControlPacket))) {
-                const ControlPacket* cp = reinterpret_cast<const ControlPacket*>(data);
-                int gui_dragging = gui_window.get_dragging_fader();
-                for (int ch = 0; ch < 5; ++ch) {
-                    if (gui_dragging != ch) {
-                        float pos = cp->fader_adc[ch] / 1023.0f;
-                        param_mgr.set_fader_direct(ch, pos);
-                        mixer.set_fader(ch, pos);
-                    }
-                }
-                afs->set_enabled(cp->btn_afs != 0);
-                stem_separator.set_enabled(cp->btn_stem != 0);
-                loudness.set_enabled(cp->btn_loud != 0);
+                HwMixedAudioPacket pkt;
+                std::memcpy(&pkt, data, sizeof(HwMixedAudioPacket));
+                out_packets.push_back(pkt);
             }
         };
 
+        std::vector<HwMixedAudioPacket> rx_mixed_batch;
+        rx_mixed_batch.reserve(8);
+
         while (is_running) {
-            // --- 버퍼 수위 조절 (Adaptive Flow Control) ---
-            if (use_real_mic.load()) {
-                if (mic_ring_buffer.get_available() < block_size) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-            } else {
-                if (wasapi_render.is_running() && wasapi_render.get_buffered_samples() >= 3072) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    continue;
-                }
-            }
-
-            if (!use_real_mic.load() && !wasapi_render.is_running()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-
             // --- A. PC GUI 상태 변화(AFS/STEM/LOUD/LUFS)를 하드웨어 시뮬레이터 및 STM32 보드로 동기화 ---
             bool cur_afs = afs->is_enabled();
             bool cur_stem = stem_separator.is_enabled();
@@ -622,160 +581,105 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 last_target_lufs = cur_lufs;
             }
 
-            // 기존 대기 중인 하드웨어 IPC/VCP 패킷 드레인
-            HwMixedAudioPacket hw_mixed_pkt;
-            bool dummy_mixed = false;
+            // --- B. 하드웨어 시뮬레이터 가상 스피커 출력 & VCP 패킷 수신 ---
+            rx_mixed_batch.clear();
             int bytes_read = 0;
             while ((bytes_read = mixer_ipc.receive_packet(ipc_rx_buf.data(), static_cast<int>(ipc_rx_buf.size()))) > 0) {
-                handle_sim_rx_packet(ipc_rx_buf.data(), bytes_read, dummy_mixed, hw_mixed_pkt);
-                if (dummy_mixed) {
-                    last_hw_sim_tp = std::chrono::steady_clock::now();
-                }
+                handle_sim_rx_packet(ipc_rx_buf.data(), bytes_read, rx_mixed_batch);
             }
 
-            // --- B. 보컬(Vocal) 마이크 입력 획득 (WASAPI Mic 또는 가상 보컬 + 하울링 주입) ---
             bool is_file_active = (use_audio_file.load() && file_player.is_playing());
+            auto now = std::chrono::steady_clock::now();
 
-            if (use_real_mic.load()) {
-                mic_ring_buffer.read(in_block.data(), block_size);
-            } else if (!is_file_active) {
-                for (size_t i = 0; i < block_size; ++i) {
-                    float sample = 0.08f * std::sin(2.0f * PI * 440.0f * t)
-                                 + 0.03f * std::sin(2.0f * PI * 880.0f * t);
-                    t += dt;
-                    in_block[i * 2] = sample;
-                    in_block[i * 2 + 1] = sample;
+            if (!rx_mixed_batch.empty()) {
+                last_hw_sim_tp = now;
+
+                // 음원 파일 재생 시작 시 기기 버퍼 프리필 (2블록)
+                if (is_file_active && !was_file_active && file_player.has_ai_stems()) {
+                    push_stems_to_device();
+                    push_stems_to_device();
                 }
-            } else {
-                std::fill(in_block.begin(), in_block.end(), 0.0f);
-            }
+                was_file_active = is_file_active;
 
-            if (inject_howling.load()) {
-                size_t rem = howl_samples_remaining.load();
-                if (rem > 0) {
-                    size_t chunk = std::min(block_size, rem);
-                    float phase_step = 2.0f * PI * howl_freq / sample_rate;
-                    for (size_t i = 0; i < chunk; ++i) {
-                        float h_sample = 0.75f * std::sin(howl_phase);
-                        howl_phase += phase_step;
-                        in_block[i * 2] += h_sample;
-                        in_block[i * 2 + 1] += h_sample;
-                    }
-                    howl_samples_remaining.fetch_sub(chunk);
-                } else {
-                    inject_howling.store(false);
-                }
-            }
-
-            // --- C. PC AI 스템(HTDemucs) 준비 ---
-            if (is_file_active) {
-                if (file_player.has_ai_stems()) {
-                    file_player.read_frames_stems(vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+                // 수신된 모든 가상 스피커 오디오 블록을 PC 출력 & 시각화 반영
+                for (size_t k = 0; k < rx_mixed_batch.size(); ++k) {
+                    const HwMixedAudioPacket& pkt = rx_mixed_batch[k];
                     for (size_t i = 0; i < block_size * 2; ++i) {
-                        file_block[i] = vocal_buf[i] + beat_buf[i] + inst_buf[i];
+                        mixed_out[i] = static_cast<float>(pkt.mixed_out_i16[i]) / 32768.0f;
                     }
-                } else {
-                    std::fill(file_block.begin(), file_block.end(), 0.0f);
-                    std::fill(vocal_buf.begin(), vocal_buf.end(), 0.0f);
+                    wasapi_render.write_samples(mixed_out.data(), block_size);
+
+                    if (is_file_active && file_player.has_ai_stems()) {
+                        push_stems_to_device();
+                    }
+                }
+
+                const HwMixedAudioPacket& latest = rx_mixed_batch.back();
+                for (int ch = 0; ch < 5; ++ch) {
+                    vu_levels[ch] = latest.vu_levels[ch];
+                }
+                for (int b = 0; b < 16; ++b) {
+                    bars[b] = latest.spectrum_bars[b];
+                }
+                gui_window.set_hw_dsp_telemetry(true, latest.active_notches,
+                                                latest.suppressed_count,
+                                                latest.measured_lufs,
+                                                latest.auto_gain_db);
+                gui_window.update_audio_data(bars, vu_levels);
+                continue;
+            }
+
+            // 시뮬레이터 가상 스피커가 살아있으면 11.61ms 패킷 도착을 1ms 단위로 대기
+            if ((now - last_hw_sim_tp) < std::chrono::milliseconds(350)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+
+            // --- C. 시뮬레이터 미실행 시 PC 오프라인 폴백 (마이크는 기기 전용이므로 PC 마이크 = 0 무음) ---
+            was_file_active = is_file_active;
+            gui_window.set_hw_dsp_telemetry(false, 0, 0, -70.0f, 0.0f);
+
+            if (wasapi_render.is_running() && wasapi_render.get_buffered_samples() >= 3072) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+
+            std::fill(in_block.begin(), in_block.end(), 0.0f);
+            if (is_file_active && file_player.has_ai_stems()) {
+                file_player.read_frames_stems(vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
+                for (size_t i = 0; i < block_size * 2; ++i) {
+                    file_block[i] = vocal_buf[i] + beat_buf[i] + inst_buf[i];
+                }
+                if (!stem_separator.is_enabled()) {
+                    std::copy(file_block.begin(), file_block.end(), vocal_buf.begin());
                     std::fill(beat_buf.begin(), beat_buf.end(), 0.0f);
                     std::fill(inst_buf.begin(), inst_buf.end(), 0.0f);
                 }
-            }
-
-            // --- D. PC -> 하드웨어 시뮬레이터(STM32 펌웨어) 오디오 입력 블록 전송 & 하드웨어 DSP 결과 수신 ---
-            host_audio_pkt.packet_type = PKT_TYPE_HOST_AUDIO_BLOCK;
-            host_audio_pkt.use_external_stems = is_file_active ? 1 : 0;
-            host_audio_pkt.num_frames = static_cast<uint16_t>(block_size);
-            for (size_t i = 0; i < block_size * 2; ++i) {
-                host_audio_pkt.mic_i16[i] = static_cast<int16_t>(std::clamp(in_block[i], -1.0f, 1.0f) * 32767.0f);
-                if (is_file_active) {
-                    host_audio_pkt.vocal_i16[i] = static_cast<int16_t>(std::clamp(vocal_buf[i], -1.0f, 1.0f) * 32767.0f);
-                    host_audio_pkt.beat_i16[i]  = static_cast<int16_t>(std::clamp(beat_buf[i], -1.0f, 1.0f) * 32767.0f);
-                    host_audio_pkt.inst_i16[i]  = static_cast<int16_t>(std::clamp(inst_buf[i], -1.0f, 1.0f) * 32767.0f);
-                } else {
-                    host_audio_pkt.vocal_i16[i] = 0;
-                    host_audio_pkt.beat_i16[i]  = 0;
-                    host_audio_pkt.inst_i16[i]  = 0;
-                }
-            }
-            mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &host_audio_pkt, sizeof(host_audio_pkt));
-
-            bool got_hw_audio = false;
-            auto now_loop = std::chrono::steady_clock::now();
-            bool sim_recently_alive = (now_loop - last_hw_sim_tp) < std::chrono::milliseconds(300);
-            int max_wait_iters = sim_recently_alive ? 5 : 1; // 시뮬레이터 연결 시 최대 ~4ms 이내 즉각 수신
-
-            for (int w = 0; w < max_wait_iters; ++w) {
-                while ((bytes_read = mixer_ipc.receive_packet(ipc_rx_buf.data(), static_cast<int>(ipc_rx_buf.size()))) > 0) {
-                    handle_sim_rx_packet(ipc_rx_buf.data(), bytes_read, got_hw_audio, hw_mixed_pkt);
-                }
-                if (got_hw_audio) break;
-                if (w + 1 < max_wait_iters) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(600));
-                }
-            }
-
-            if (got_hw_audio) {
-                last_hw_sim_tp = std::chrono::steady_clock::now();
-
-                // STM32 하드웨어 시뮬레이터 DSP 출력 오디오 및 텔레메트리 사용
-                for (size_t i = 0; i < block_size * 2; ++i) {
-                    mixed_out[i] = static_cast<float>(hw_mixed_pkt.mixed_out_i16[i]) / 32768.0f;
-                }
-                for (int ch = 0; ch < 5; ++ch) {
-                    vu_levels[ch] = hw_mixed_pkt.vu_levels[ch];
-                }
-                for (int b = 0; b < 16; ++b) {
-                    bars[b] = hw_mixed_pkt.spectrum_bars[b];
-                }
-                gui_window.set_hw_dsp_telemetry(true, hw_mixed_pkt.active_notches,
-                                                hw_mixed_pkt.suppressed_count,
-                                                hw_mixed_pkt.measured_lufs,
-                                                hw_mixed_pkt.auto_gain_db);
-            } else {
-                // 시뮬레이터 미실행 시 PC 로컬 DSP 폴백 구동
-                if ((std::chrono::steady_clock::now() - last_hw_sim_tp) >= std::chrono::milliseconds(300)) {
-                    gui_window.set_hw_dsp_telemetry(false, 0, 0, -70.0f, 0.0f);
-                }
-
-                afs->process(in_block.data(), block_size);
-                if (is_file_active) {
-                    if (file_player.has_ai_stems() && !stem_separator.is_enabled()) {
-                        std::copy(file_block.begin(), file_block.end(), vocal_buf.begin());
-                        std::fill(beat_buf.begin(), beat_buf.end(), 0.0f);
-                        std::fill(inst_buf.begin(), inst_buf.end(), 0.0f);
-                    }
-                } else {
-                    stem_separator.process(in_block.data(), vocal_buf.data(), beat_buf.data(), inst_buf.data(), block_size);
-                    std::fill(line2_buf.begin(), line2_buf.end(), 0.0f);
-                }
 
                 std::vector<const float*> mixer_inputs = {
-                    is_file_active ? file_block.data() : in_block.data(),
+                    file_block.data(),
                     vocal_buf.data(),
                     beat_buf.data(),
-                    in_block.data(),
-                    is_file_active ? inst_buf.data() : line2_buf.data()
+                    in_block.data(), // CH3 Mic = 0 (기기 전용)
+                    inst_buf.data()
                 };
-
                 for (int ch = 0; ch < 5; ++ch) {
                     const float* src = mixer_inputs[ch];
                     float sum_sq = 0.0f;
-                    for (size_t i = 0; i < block_size * 2; ++i) {
-                        sum_sq += src[i] * src[i];
-                    }
-                    float rms = std::sqrt(sum_sq / (block_size * 2));
-                    vu_levels[ch] = rms * mixer.get_channel(ch).get_gain_linear();
+                    for (size_t i = 0; i < block_size * 2; ++i) sum_sq += src[i] * src[i];
+                    vu_levels[ch] = std::sqrt(sum_sq / (block_size * 2)) * mixer.get_channel(ch).get_gain_linear();
                 }
-
                 mixer.mix(mixer_inputs, mixed_out.data(), block_size);
                 loudness.process(mixed_out.data(), block_size);
                 bars = spectrum.compute_bars(mixed_out.data(), block_size);
+                wasapi_render.write_samples(mixed_out.data(), block_size);
+                gui_window.update_audio_data(bars, vu_levels);
+            } else {
+                std::fill(vu_levels.begin(), vu_levels.end(), 0.0f);
+                std::fill(bars.begin(), bars.end(), 0.0f);
+                gui_window.update_audio_data(bars, vu_levels);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-
-            // --- E. 실시간 오디오 스피커 출력 (WASAPI Render) & PC GUI 시각화 갱신 ---
-            wasapi_render.write_samples(mixed_out.data(), block_size);
-            gui_window.update_audio_data(bars, vu_levels);
         }
     });
 
