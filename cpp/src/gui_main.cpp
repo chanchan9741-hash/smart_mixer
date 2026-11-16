@@ -14,6 +14,8 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <algorithm>
 
 #include "../include/config.hpp"
 #include "../include/ring_buffer.hpp"
@@ -28,13 +30,13 @@
 #include "../include/wasapi_render.hpp"
 #include "../include/audio_file_player.hpp"
 #include "../include/hardware_ipc.hpp"
+#include "../include/serial_port.hpp"
 #include "../include/gui_window.hpp"
 
 using namespace SmartMixer;
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
-    (void)lpCmdLine;
     (void)nCmdShow;
 
     // 고해상도 타이머 활성화 (1ms 주기) - 윈도우 스케줄링 오디오 지연 및 지터 방지
@@ -78,6 +80,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     MixerGUIWindow gui_window(hInstance, mixer, *afs, loudness, stem_separator, param_mgr, spectrum, wasapi, file_player, wasapi_render);
     pWindow = &gui_window;
 
+    // 4-2. 실제 STM32 보드 USB VCP 시리얼 연동 객체 (--com COMx 옵션 전달 시 활성)
+    Win32SerialPort hw_serial(param_mgr);
+    hw_serial.set_afs_event_callback([&](float freq) {
+        char msg_buf[128];
+        std::snprintf(msg_buf, sizeof(msg_buf), "⚠️ STM32 Howling Suppressed at %.0fHz!", freq);
+        gui_window.show_toast(msg_buf, 3.0f);
+    });
+
+    int last_hw_encoder_val = 0;
+    param_mgr.set_callback([&](const std::string& param, float val) {
+        if (param.rfind("fader_", 0) == 0 && param.size() == 7) {
+            int ch = param[6] - '0';
+            if (ch >= 0 && ch < 5 && gui_window.get_dragging_fader() != ch) {
+                mixer.set_fader(ch, val);
+            }
+        } else if (param == "afs_enabled") {
+            afs->set_enabled(val > 0.5f);
+        } else if (param == "stem_enabled") {
+            stem_separator.set_enabled(val > 0.5f);
+        } else if (param == "loudness_enabled") {
+            loudness.set_enabled(val > 0.5f);
+        } else if (param == "encoder") {
+            int cur_enc = static_cast<int>(std::lround(val));
+            int delta = cur_enc - last_hw_encoder_val;
+            last_hw_encoder_val = cur_enc;
+            if (delta != 0) {
+                float next_lufs = std::clamp(loudness.get_target_lufs() + delta * 0.5f, -24.0f, -6.0f);
+                loudness.set_target_lufs(next_lufs);
+            }
+        }
+    });
+
     // 하울링 강제 주입 및 필터 리셋 콜백
     std::atomic<bool> inject_howling(false);
     std::atomic<size_t> howl_samples_remaining(0);
@@ -93,9 +127,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     gui_window.set_reset_filters_callback([&]() {
         afs->clear_filters();
+        if (hw_serial.is_connected()) {
+            hw_serial.send_reset_afs();
+        }
     });
 
-    // 슬라이더 조작 시 하드웨어 시뮬레이터로 즉각 전송 (초저지연 양방향 동기화)
+    // 슬라이더 조작 시 하드웨어 시뮬레이터 및 실제 STM32 보드로 즉각 전송 (초저지연 양방향 동기화)
     gui_window.set_fader_changed_callback([&](int ch, float norm) {
         (void)norm;
         FeedbackPacket pkt;
@@ -109,6 +146,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         pkt.active_channel = static_cast<int8_t>(ch);
         mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &pkt, sizeof(pkt));
+        if (hw_serial.is_connected()) {
+            hw_serial.send_fader_sync();
+        }
     });
 
     gui_window.set_fader_drag_end_callback([&](int ch) {
@@ -124,6 +164,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         pkt.active_channel = -1;
         mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &pkt, sizeof(pkt));
+        if (hw_serial.is_connected()) {
+            hw_serial.send_fader_sync();
+        }
     });
 
     // 5. 음원 파일 로드 및 Demucs HTDemucs AI 스템 분리 파이프라인
@@ -426,6 +469,43 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    // 선택적 --com COMx 인자 파싱 (실제 STM32 USB VCP 연결 시에만 시리얼 포트 개방, 미지정 시 지연 0ms)
+    if (lpCmdLine && lpCmdLine[0] != '\0') {
+        std::string cmd_str(lpCmdLine);
+        std::string com_port;
+        size_t pos = 0;
+        while (pos < cmd_str.size()) {
+            while (pos < cmd_str.size() && (cmd_str[pos] == ' ' || cmd_str[pos] == '\t')) ++pos;
+            if (pos >= cmd_str.size()) break;
+            size_t end = pos;
+            while (end < cmd_str.size() && cmd_str[end] != ' ' && cmd_str[end] != '\t') ++end;
+            std::string tok = cmd_str.substr(pos, end - pos);
+            pos = end;
+
+            if (tok.rfind("--com=", 0) == 0 && tok.size() > 6) {
+                com_port = tok.substr(6);
+            } else if (tok == "--com") {
+                while (pos < cmd_str.size() && (cmd_str[pos] == ' ' || cmd_str[pos] == '\t')) ++pos;
+                size_t end2 = pos;
+                while (end2 < cmd_str.size() && cmd_str[end2] != ' ' && cmd_str[end2] != '\t') ++end2;
+                if (end2 > pos) {
+                    com_port = cmd_str.substr(pos, end2 - pos);
+                    pos = end2;
+                }
+            }
+        }
+        if (!com_port.empty()) {
+            if (hw_serial.open(com_port, 115200)) {
+                hw_serial.send_led_state(afs->is_enabled(), stem_separator.is_enabled(), loudness.is_enabled());
+                hw_serial.send_fader_sync();
+                hw_serial.send_target_lufs(loudness.get_target_lufs());
+                gui_window.show_toast("STM32 Hardware Connected (" + com_port + ")", 3.0f);
+            } else {
+                gui_window.show_toast("STM32 Serial Open Failed (" + com_port + ") - PC Mode", 3.5f);
+            }
+        }
+    }
+
     // 6. 백그라운드 실시간 오디오 DSP & 하드웨어 IPC 스레드 가동
     std::atomic<bool> is_running(true);
     std::thread audio_thread([&]() {
@@ -449,6 +529,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         uint8_t ipc_rx_buf[8192];
         FeedbackPacket fb_pkt;
         fb_pkt.packet_type = PKT_TYPE_FEEDBACK;
+
+        bool last_led_afs = afs->is_enabled();
+        bool last_led_stem = stem_separator.is_enabled();
+        bool last_led_loud = loudness.is_enabled();
+        float last_target_lufs = loudness.get_target_lufs();
 
         while (is_running) {
             // --- 버퍼 수위 조절 (Adaptive Flow Control) ---
@@ -625,7 +710,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             auto bars = spectrum.compute_bars(mixed_out.data(), block_size);
             gui_window.update_audio_data(bars, vu_levels);
 
-            // --- H. 하드웨어 시뮬레이터로 피드백 전송 (LED 상태, 5채널 페이더 동기화 & OLED 화면 버퍼) ---
+            // --- H. 하드웨어 시뮬레이터 및 실제 STM32 보드로 피드백 전송 (LED 상태, 5채널 페이더 동기화 & OLED 화면 버퍼) ---
             fb_pkt.led_afs = afs->is_enabled() ? 1 : 0;
             fb_pkt.led_stem = stem_separator.is_enabled() ? 1 : 0;
             fb_pkt.led_loud = loudness.is_enabled() ? 1 : 0;
@@ -635,6 +720,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             fb_pkt.active_channel = static_cast<int8_t>(gui_window.get_dragging_fader());
             spectrum.generate_oled_buffer(bars, fb_pkt.oled_framebuffer);
             mixer_ipc.send_packet(HardwareIpcSocket::SIMULATOR_PORT, &fb_pkt, sizeof(fb_pkt));
+
+            bool cur_afs = (fb_pkt.led_afs != 0);
+            bool cur_stem = (fb_pkt.led_stem != 0);
+            bool cur_loud = (fb_pkt.led_loud != 0);
+            float cur_lufs = loudness.get_target_lufs();
+            if (hw_serial.is_connected()) {
+                if (cur_afs != last_led_afs || cur_stem != last_led_stem || cur_loud != last_led_loud) {
+                    hw_serial.send_led_state(cur_afs, cur_stem, cur_loud);
+                }
+                if (std::fabs(cur_lufs - last_target_lufs) > 0.05f) {
+                    hw_serial.send_target_lufs(cur_lufs);
+                }
+            }
+            last_led_afs = cur_afs;
+            last_led_stem = cur_stem;
+            last_led_loud = cur_loud;
+            last_target_lufs = cur_lufs;
         }
     });
 
@@ -647,6 +749,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // 8. 종료 시 정리
     is_running.store(false);
+    hw_serial.close();
     wasapi.stop();
     wasapi_render.stop();
     mixer_ipc.close();

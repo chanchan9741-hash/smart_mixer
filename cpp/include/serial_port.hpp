@@ -1,5 +1,8 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -7,6 +10,7 @@
 #include <atomic>
 #include <functional>
 #include <sstream>
+#include <iomanip>
 #include <iostream>
 #include "controller_mapper.hpp"
 
@@ -15,6 +19,7 @@ namespace SmartMixer {
 class Win32SerialPort {
 public:
     using PacketCallback = std::function<void(const std::string&)>;
+    using AfsEventCallback = std::function<void(float)>;
 
     Win32SerialPort(ParameterManager& param_mgr)
         : m_param_mgr(param_mgr),
@@ -96,10 +101,33 @@ public:
         return WriteFile(m_handle, cmd.c_str(), static_cast<DWORD>(cmd.length()), &bytes_written, nullptr);
     }
 
+    void set_afs_event_callback(AfsEventCallback cb) { m_afs_event_cb = cb; }
+
     void send_led_state(bool afs, bool stem, bool loud) {
         std::ostringstream ss;
         ss << "[LED:" << (afs ? "1" : "0") << "," << (stem ? "1" : "0") << "," << (loud ? "1" : "0") << "]\n";
         send_command(ss.str());
+    }
+
+    void send_fader_sync() {
+        std::ostringstream ss;
+        ss << "[FADER:"
+           << m_param_mgr.get_fader_adc(0) << ","
+           << m_param_mgr.get_fader_adc(1) << ","
+           << m_param_mgr.get_fader_adc(2) << ","
+           << m_param_mgr.get_fader_adc(3) << ","
+           << m_param_mgr.get_fader_adc(4) << "]\n";
+        send_command(ss.str());
+    }
+
+    void send_target_lufs(float lufs) {
+        std::ostringstream ss;
+        ss << "[LUFS:" << std::fixed << std::setprecision(1) << lufs << "]\n";
+        send_command(ss.str());
+    }
+
+    void send_reset_afs() {
+        send_command("[RESET_AFS]\n");
     }
 
 private:
@@ -129,8 +157,9 @@ private:
 
     // STM32 수신 패킷 파싱
     // F:1023,800,600,900,850 (5채널 ADC)
-    // B:AFS, B:STEM, B:LOUD (기능 버튼)
+    // B:AFS, B:STEM, B:LOUD, B:AFS_RESET (기능 버튼)
     // E:+1, E:-1 (인코더 회전)
+    // [AFS_EVENT:2500.0] (온보드 AFS 하울링 감지 알림)
     void parse_packet(const std::string& packet) {
         if (packet.rfind("F:", 0) == 0) {
             std::stringstream ss(packet.substr(2));
@@ -153,6 +182,11 @@ private:
             m_param_mgr.update_encoder(1);
         } else if (packet == "E:-1") {
             m_param_mgr.update_encoder(-1);
+        } else if (packet.rfind("[AFS_EVENT:", 0) == 0) {
+            try {
+                float freq = std::stof(packet.substr(11));
+                if (m_afs_event_cb) m_afs_event_cb(freq);
+            } catch (...) {}
         }
     }
 
@@ -161,6 +195,7 @@ private:
     std::atomic<bool> m_is_connected;
     std::atomic<bool> m_is_running;
     std::thread m_thread;
+    AfsEventCallback m_afs_event_cb;
 };
 
 } // namespace SmartMixer
