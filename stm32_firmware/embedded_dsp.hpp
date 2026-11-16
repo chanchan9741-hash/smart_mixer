@@ -563,6 +563,7 @@ public:
     void set_target_lufs(float t) { m_target_lufs = mcu_clamp(t, -24.0f, -8.0f); }
     float get_target_lufs() const { return m_target_lufs; }
     float get_measured_lufs() const { return m_measured_lufs; }
+    float get_current_gain_db() const { return 20.0f * std::log10(m_current_gain + 1e-6f); }
 
     void process(float* stereo_buffer, size_t num_frames) {
         if (!m_enabled || num_frames == 0 || num_frames > MAX_BLOCK) return;

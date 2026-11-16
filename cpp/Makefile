@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -Iinclude
-WIN_LIBS = -lgdi32 -lcomctl32 -lcomdlg32 -lmsimg32 -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid
+WIN_LIBS = -lgdi32 -lcomctl32 -lcomdlg32 -lmsimg32 -lole32 -lws2_32 -lwinmm -lmfplat -lmfreadwrite -lmfuuid
 
 all: smart_mixer_gui.exe hardware_sim_gui.exe smart_mixer.exe test_suite.exe
 

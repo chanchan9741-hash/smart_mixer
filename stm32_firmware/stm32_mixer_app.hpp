@@ -47,6 +47,8 @@ public:
         for (int b = 0; b < EQ_BANDS_COUNT; ++b) {
             m_eq_filters[b].reset(0.5f);
         }
+        m_vu_levels.fill(0.0f);
+        m_eq_db.fill(0.0f);
         m_latest_out.fill(0.0f);
         m_rx_buf.fill(0);
     }
@@ -110,23 +112,65 @@ public:
             (usb_in_i16 ? m_line_f.data() : m_inst_f.data())
         };
 
-        // 4. 5채널 안티-팝 믹싱 & 3-Band EQ
-        m_mixer.mix(ch_inputs, m_mixed_f.data(), num_frames);
+        finish_audio_block(ch_inputs, dac_out_i16, usb_out_i16, num_frames);
+    }
 
-        // 5. 라우드니스 매치 & 피크 리미터
-        m_loudness.process(m_mixed_f.data(), num_frames);
-
-        // 6. 최신 출력 스펙트럼용 스냅샷 저장 & int16 DAC/USB 출력 변환
-        std::memcpy(m_latest_out.data(), m_mixed_f.data(), num_frames * 2 * sizeof(float));
-        m_latest_frames = num_frames;
-        m_has_latest_audio = true;
+    /**
+     * @brief PC 호스트(WASAPI Mic + HTDemucs AI 스템) + 보드 합성기 입력을 온보드 DSP로 처리
+     */
+    void process_multitrack_audio_block(const int16_t* mic_in_i16,
+                                        const int16_t* vocal_in_i16,
+                                        const int16_t* beat_in_i16,
+                                        const int16_t* line_inst_in_i16,
+                                        int16_t* dac_out_i16,
+                                        size_t num_frames,
+                                        bool use_external_stems) {
+        if (num_frames == 0 || num_frames > BLOCK_SIZE) return;
 
         for (size_t i = 0; i < num_frames * 2; ++i) {
-            float s = mcu_clamp(m_mixed_f[i], -1.0f, 1.0f);
-            int16_t pcm = static_cast<int16_t>(s * 32767.0f);
-            if (dac_out_i16) dac_out_i16[i] = pcm;
-            if (usb_out_i16) usb_out_i16[i] = pcm;
+            m_mic_f[i]   = mic_in_i16       ? (static_cast<float>(mic_in_i16[i]) / 32768.0f)       : 0.0f;
+            m_vocal_f[i] = vocal_in_i16     ? (static_cast<float>(vocal_in_i16[i]) / 32768.0f)     : 0.0f;
+            m_beat_f[i]  = beat_in_i16      ? (static_cast<float>(beat_in_i16[i]) / 32768.0f)      : 0.0f;
+            m_inst_f[i]  = line_inst_in_i16 ? (static_cast<float>(line_inst_in_i16[i]) / 32768.0f) : 0.0f;
         }
+
+        // CH3 마이크 입력단 실시간 AFS 하울링 억제 (음악 원음 음질 보존)
+        float howling_freq = m_afs.process(m_mic_f.data(), num_frames);
+        if (howling_freq > 0.0f) {
+            uint32_t now = get_now_ms();
+            m_howling_alert_until_ms = now + 3000;
+            char msg[48];
+            int n = std::snprintf(msg, sizeof(msg), "[AFS_EVENT:%.1f]\n", static_cast<double>(howling_freq));
+            if (n > 0) send_vcp(msg, static_cast<uint16_t>(n));
+        }
+
+        if (use_external_stems) {
+            for (size_t i = 0; i < num_frames * 2; ++i) {
+                m_usb_f[i] = m_vocal_f[i] + m_beat_f[i] + m_inst_f[i];
+            }
+            if (!m_stft.is_enabled()) {
+                std::memcpy(m_vocal_f.data(), m_usb_f.data(), num_frames * 2 * sizeof(float));
+                std::memset(m_beat_f.data(), 0, num_frames * 2 * sizeof(float));
+                std::memset(m_inst_f.data(), 0, num_frames * 2 * sizeof(float));
+            }
+        } else {
+            if (!vocal_in_i16 && num_frames == BLOCK_SIZE) {
+                m_stft.process_block_512(m_mic_f.data(), m_vocal_f.data(), m_line_f.data(), m_usb_f.data());
+            } else if (!vocal_in_i16) {
+                std::memcpy(m_vocal_f.data(), m_mic_f.data(), num_frames * 2 * sizeof(float));
+            }
+            std::memcpy(m_usb_f.data(), m_mic_f.data(), num_frames * 2 * sizeof(float));
+        }
+
+        const float* ch_inputs[EmbeddedMixer::NUM_CHANNELS] = {
+            m_usb_f.data(),   // CH0: Master reference
+            m_vocal_f.data(), // CH1: Vocal (STFT or HTDemucs Vocal)
+            m_beat_f.data(),  // CH2: Beat (Synth Drum or HTDemucs Beat)
+            m_mic_f.data(),   // CH3: Mic In 1 (AFS Protected)
+            m_inst_f.data()   // CH4: Line 2 / Inst
+        };
+
+        finish_audio_block(ch_inputs, dac_out_i16, nullptr, num_frames);
     }
 
     /**
@@ -152,13 +196,12 @@ public:
         }
 
         if (eq_adc) {
-            float eq_db[EQ_BANDS_COUNT];
             for (int b = 0; b < EQ_BANDS_COUNT; ++b) {
                 float norm = mcu_clamp(static_cast<float>(eq_adc[b]) * inv_max, 0.0f, 1.0f);
                 float sm = m_eq_filters[b].update(norm);
-                eq_db[b] = -12.0f + sm * 24.0f;
+                m_eq_db[b] = -12.0f + sm * 24.0f;
             }
-            m_mixer.set_master_eq_db(eq_db[0], eq_db[1], eq_db[2]);
+            m_mixer.set_master_eq_db(m_eq_db[0], m_eq_db[1], m_eq_db[2]);
         }
 
         if (changed) {
@@ -248,8 +291,52 @@ public:
     const EmbeddedMixer& get_mixer() const { return m_mixer; }
     const EmbeddedOledRenderer& get_oled() const { return m_oled; }
     bool is_stem_enabled() const { return m_stft.is_enabled(); }
+    bool get_led_afs() const { return m_afs.is_enabled(); }
+    bool get_led_stem() const { return m_stft.is_enabled(); }
+    bool get_led_loud() const { return m_loudness.is_enabled(); }
+    bool is_howling_alert() const { return get_now_ms() < m_howling_alert_until_ms; }
+    float get_vu_level(int ch) const { return (ch >= 0 && ch < 5) ? m_vu_levels[ch] : 0.0f; }
+    uint16_t get_fader_adc_smoothed(int ch) const { return (ch >= 0 && ch < ADC_CHANNELS_COUNT) ? m_fader_adc_last[ch] : 0; }
+    float get_eq_db(int b) const { return (b >= 0 && b < EQ_BANDS_COUNT) ? m_eq_db[b] : 0.0f; }
 
 private:
+    void finish_audio_block(const float* const ch_inputs[EmbeddedMixer::NUM_CHANNELS],
+                            int16_t* dac_out_i16,
+                            int16_t* usb_out_i16,
+                            size_t num_frames) {
+        // 채널별 VU RMS 레벨 측정
+        for (int ch = 0; ch < 5; ++ch) {
+            const float* src = ch_inputs[ch];
+            if (!src) {
+                m_vu_levels[ch] = 0.0f;
+                continue;
+            }
+            float sum_sq = 0.0f;
+            for (size_t i = 0; i < num_frames * 2; ++i) {
+                sum_sq += src[i] * src[i];
+            }
+            float rms = std::sqrt(sum_sq / static_cast<float>(num_frames * 2));
+            m_vu_levels[ch] = rms * m_mixer.get_gain_linear(ch);
+        }
+
+        // 5채널 안티-팝 믹싱 & 3-Band EQ
+        m_mixer.mix(ch_inputs, m_mixed_f.data(), num_frames);
+
+        // 라우드니스 매치 & 피크 리미터
+        m_loudness.process(m_mixed_f.data(), num_frames);
+
+        // 최신 출력 스펙트럼용 스냅샷 저장 & int16 DAC/USB 출력 변환
+        std::memcpy(m_latest_out.data(), m_mixed_f.data(), num_frames * 2 * sizeof(float));
+        m_latest_frames = num_frames;
+        m_has_latest_audio = true;
+
+        for (size_t i = 0; i < num_frames * 2; ++i) {
+            float s = mcu_clamp(m_mixed_f[i], -1.0f, 1.0f);
+            int16_t pcm = static_cast<int16_t>(s * 32767.0f);
+            if (dac_out_i16) dac_out_i16[i] = pcm;
+            if (usb_out_i16) usb_out_i16[i] = pcm;
+        }
+    }
     void parse_host_command(const char* cmd) {
         if (std::strncmp(cmd, "[LED:", 5) == 0) {
             int a = 1, s = 1, l = 1;
@@ -327,6 +414,8 @@ private:
     std::array<float, BLOCK_SIZE * 2> m_inst_f;
     std::array<float, BLOCK_SIZE * 2> m_mixed_f;
     std::array<float, BLOCK_SIZE * 2> m_latest_out;
+    std::array<float, 5> m_vu_levels;
+    std::array<float, EQ_BANDS_COUNT> m_eq_db;
     size_t m_latest_frames = 0;
     bool m_has_latest_audio;
 };

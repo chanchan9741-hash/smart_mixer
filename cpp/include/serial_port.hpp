@@ -101,33 +101,55 @@ public:
         return WriteFile(m_handle, cmd.c_str(), static_cast<DWORD>(cmd.length()), &bytes_written, nullptr);
     }
 
+    using AfsResetCallback = std::function<void()>;
     void set_afs_event_callback(AfsEventCallback cb) { m_afs_event_cb = cb; }
+    void set_afs_reset_callback(AfsResetCallback cb) { m_afs_reset_cb = cb; }
 
-    void send_led_state(bool afs, bool stem, bool loud) {
+    static std::string format_led_cmd(bool afs, bool stem, bool loud) {
         std::ostringstream ss;
         ss << "[LED:" << (afs ? "1" : "0") << "," << (stem ? "1" : "0") << "," << (loud ? "1" : "0") << "]\n";
-        send_command(ss.str());
+        return ss.str();
+    }
+
+    static std::string format_fader_cmd(const ParameterManager& pm) {
+        std::ostringstream ss;
+        ss << "[FADER:"
+           << pm.get_fader_adc(0) << ","
+           << pm.get_fader_adc(1) << ","
+           << pm.get_fader_adc(2) << ","
+           << pm.get_fader_adc(3) << ","
+           << pm.get_fader_adc(4) << "]\n";
+        return ss.str();
+    }
+
+    static std::string format_lufs_cmd(float lufs) {
+        std::ostringstream ss;
+        ss << "[LUFS:" << std::fixed << std::setprecision(1) << lufs << "]\n";
+        return ss.str();
+    }
+
+    static std::string format_reset_afs_cmd() {
+        return "[RESET_AFS]\n";
+    }
+
+    void send_led_state(bool afs, bool stem, bool loud) {
+        send_command(format_led_cmd(afs, stem, loud));
     }
 
     void send_fader_sync() {
-        std::ostringstream ss;
-        ss << "[FADER:"
-           << m_param_mgr.get_fader_adc(0) << ","
-           << m_param_mgr.get_fader_adc(1) << ","
-           << m_param_mgr.get_fader_adc(2) << ","
-           << m_param_mgr.get_fader_adc(3) << ","
-           << m_param_mgr.get_fader_adc(4) << "]\n";
-        send_command(ss.str());
+        send_command(format_fader_cmd(m_param_mgr));
     }
 
     void send_target_lufs(float lufs) {
-        std::ostringstream ss;
-        ss << "[LUFS:" << std::fixed << std::setprecision(1) << lufs << "]\n";
-        send_command(ss.str());
+        send_command(format_lufs_cmd(lufs));
     }
 
     void send_reset_afs() {
-        send_command("[RESET_AFS]\n");
+        send_command(format_reset_afs_cmd());
+    }
+
+    void process_vcp_line(const std::string& packet) {
+        parse_packet(packet);
     }
 
 private:
@@ -174,6 +196,8 @@ private:
             }
         } else if (packet == "B:AFS") {
             m_param_mgr.toggle_afs();
+        } else if (packet == "B:AFS_RESET") {
+            if (m_afs_reset_cb) m_afs_reset_cb();
         } else if (packet == "B:STEM") {
             m_param_mgr.toggle_stem();
         } else if (packet == "B:LOUD") {
@@ -196,6 +220,7 @@ private:
     std::atomic<bool> m_is_running;
     std::thread m_thread;
     AfsEventCallback m_afs_event_cb;
+    AfsResetCallback m_afs_reset_cb;
 };
 
 } // namespace SmartMixer

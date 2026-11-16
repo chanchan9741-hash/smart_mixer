@@ -11,7 +11,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo [2/4] Compiling Hardware Simulator (hardware_sim_gui.exe)...
-g++ -std=c++17 -O3 -mwindows -Iinclude src/hardware_sim_main.cpp -lgdi32 -lcomctl32 -lmsimg32 -lole32 -lws2_32 -o hardware_sim_gui.exe
+g++ -std=c++17 -O3 -mwindows -Iinclude src/hardware_sim_main.cpp -lgdi32 -lcomctl32 -lmsimg32 -lole32 -lws2_32 -lwinmm -o hardware_sim_gui.exe
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Failed to compile hardware_sim_gui.exe
     exit /b %ERRORLEVEL%

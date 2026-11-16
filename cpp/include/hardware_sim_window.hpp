@@ -17,11 +17,36 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <mutex>
+#include <array>
 
 #include "hardware_ipc.hpp"
 #include "hardware_audio_synth.hpp"
 
 namespace SmartMixer {
+
+struct RawHwInputs {
+    uint16_t fader_adc[5];
+    uint16_t eq_adc[3];
+    bool btn_afs_down;
+    bool btn_stem_down;
+    bool btn_loud_down;
+    int8_t encoder_delta;
+    int8_t dragging_fader;
+};
+
+struct McuUiTelemetry {
+    uint8_t led_afs = 1;
+    uint8_t led_stem = 1;
+    uint8_t led_loud = 1;
+    uint8_t active_notches = 0;
+    uint32_t suppressed_count = 0;
+    float measured_lufs = -70.0f;
+    float target_lufs = -14.0f;
+    float eq_db[3] = { 0.0f, 0.0f, 0.0f };
+    bool pc_host_linked = false;
+    bool howling_alert = false;
+};
 
 class HardwareSimWindow {
 public:
@@ -31,55 +56,76 @@ public:
           m_synth(synth),
           m_ipc(ipc),
           m_dragging_fader(-1),
+          m_dragging_eq(-1),
+          m_eq_drag_start_y(0),
+          m_eq_drag_start_adc(512),
+          m_pressed_btn(-1),
+          m_encoder_accum(0),
           m_led_afs(1),
           m_led_stem(1),
           m_led_loud(1) {
-        
-        m_fader_adc.resize(5, 820); // 기본값 약 0.8 (820 / 1023)
-        m_eq_knobs[0] = 0; // Low (dB)
-        m_eq_knobs[1] = 0; // Mid (dB)
-        m_eq_knobs[2] = 0; // High (dB)
-
-        // OLED 프레임버퍼 (128 x 64 bits = 1024 bytes)
+        m_raw_fader_adc.fill(819);
+        m_display_fader_adc.fill(819);
+        m_raw_eq_adc.fill(512); // 0 dB center
+        m_btn_pressed.fill(false);
         m_oled_buffer.resize(1024, 0);
     }
 
-    void update_feedback(uint8_t led_afs, uint8_t led_stem, uint8_t led_loud,
-                         const uint16_t* fader_adc, int8_t gui_channel, const uint8_t* oled_fb) {
-        (void)gui_channel;
-        m_led_afs = led_afs;
-        m_led_stem = led_stem;
-        m_led_loud = led_loud;
-        if (fader_adc) {
-            for (int i = 0; i < 5; ++i) {
-                // 사용자가 하드웨어 창에서 직접 마우스로 드래그 중인 채널이 아니라면
-                // 메인 믹서의 슬라이더 위치로 실시간 동기화 (모터 페이더 에뮬레이션)
-                if (m_dragging_fader != i) {
-                    m_fader_adc[i] = fader_adc[i];
-                }
-            }
+    RawHwInputs snapshot_inputs() {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        RawHwInputs out;
+        for (int i = 0; i < 5; ++i) {
+            out.fader_adc[i] = static_cast<uint16_t>(m_raw_fader_adc[i]);
         }
-        if (oled_fb) {
-            std::copy(oled_fb, oled_fb + 1024, m_oled_buffer.begin());
+        for (int k = 0; k < 3; ++k) {
+            out.eq_adc[k] = static_cast<uint16_t>(m_raw_eq_adc[k]);
+        }
+        out.btn_afs_down = m_btn_pressed[0];
+        out.btn_stem_down = m_btn_pressed[1];
+        out.btn_loud_down = m_btn_pressed[2];
+        out.encoder_delta = static_cast<int8_t>(std::clamp(m_encoder_accum, -12, 12));
+        m_encoder_accum = 0;
+        out.dragging_fader = static_cast<int8_t>(m_dragging_fader);
+        return out;
+    }
+
+    void sync_faders_from_host(const uint16_t fader_adc[5], int8_t host_active_ch) {
+        (void)host_active_ch;
+        if (!fader_adc) return;
+        std::lock_guard<std::mutex> lock(m_mtx);
+        for (int i = 0; i < 5; ++i) {
+            if (m_dragging_fader != i) {
+                int clamped = std::clamp(static_cast<int>(fader_adc[i]), 0, 1023);
+                m_raw_fader_adc[i] = clamped;
+                m_display_fader_adc[i] = clamped;
+            }
         }
     }
 
-    void send_control_update() {
-        ControlPacket pkt;
-        pkt.packet_type = PKT_TYPE_CONTROL;
-        for (int i = 0; i < 5; ++i) {
-            pkt.fader_adc[i] = static_cast<uint16_t>(m_fader_adc[i]);
-        }
-        pkt.eq_low = m_eq_knobs[0];
-        pkt.eq_mid = m_eq_knobs[1];
-        pkt.eq_high = m_eq_knobs[2];
-        pkt.btn_afs = m_led_afs;
-        pkt.btn_stem = m_led_stem;
-        pkt.btn_loud = m_led_loud;
-        pkt.encoder_delta = 0;
-        pkt.active_channel = static_cast<int8_t>(m_dragging_fader);
+    void set_mcu_leds(uint8_t afs, uint8_t stem, uint8_t loud) {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        m_led_afs = afs;
+        m_led_stem = stem;
+        m_led_loud = loud;
+    }
 
-        m_ipc.send_packet(HardwareIpcSocket::MIXER_PORT, &pkt, sizeof(pkt));
+    void set_mcu_oled(const uint8_t* oled_fb) {
+        if (!oled_fb) return;
+        std::lock_guard<std::mutex> lock(m_mtx);
+        std::copy(oled_fb, oled_fb + 1024, m_oled_buffer.begin());
+    }
+
+    void update_mcu_telemetry(const McuUiTelemetry& tel, const uint16_t smoothed_faders[5]) {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        m_telemetry = tel;
+        m_led_afs = tel.led_afs;
+        m_led_stem = tel.led_stem;
+        m_led_loud = tel.led_loud;
+        if (smoothed_faders) {
+            for (int i = 0; i < 5; ++i) {
+                m_display_fader_adc[i] = smoothed_faders[i];
+            }
+        }
     }
 
     bool create(int width = 960, int height = 620) {
@@ -88,7 +134,7 @@ public:
         wc.lpfnWndProc = StaticWndProc;
         wc.hInstance = m_hInstance;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = CreateSolidBrush(RGB(22, 23, 26)); // Brushed metal dark
+        wc.hbrBackground = CreateSolidBrush(RGB(22, 23, 26));
         wc.lpszClassName = L"HardwareSimClass";
 
         RegisterClassExW(&wc);
@@ -99,7 +145,7 @@ public:
         m_hWnd = CreateWindowExW(
             0,
             wc.lpszClassName,
-            L"🎛️ Physical Hardware Simulator (STM32H743 Audio Board)",
+            L"🎛️ Physical Hardware Simulator (STM32H743 Live Firmware)",
             (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME) | WS_VISIBLE,
             CW_USEDEFAULT, CW_USEDEFAULT,
             rc.right - rc.left, rc.bottom - rc.top,
@@ -110,9 +156,6 @@ public:
 
         // 60 FPS 렌더링 타이머
         SetTimer(m_hWnd, 1, 16, nullptr);
-
-        // 초기 제어값 전송
-        send_control_update();
         return true;
     }
 
@@ -123,15 +166,25 @@ private:
     HWND m_hWnd;
     HardwareAudioSynthesizer& m_synth;
     HardwareIpcSocket& m_ipc;
+    mutable std::mutex m_mtx;
 
-    std::vector<int> m_fader_adc;
-    int8_t m_eq_knobs[3];
+    std::array<int, 5> m_raw_fader_adc;
+    std::array<int, 5> m_display_fader_adc;
+    std::array<int, 3> m_raw_eq_adc;
+    std::array<bool, 3> m_btn_pressed;
+
     int m_dragging_fader;
+    int m_dragging_eq;
+    int m_eq_drag_start_y;
+    int m_eq_drag_start_adc;
+    int m_pressed_btn;
+    int m_encoder_accum;
 
     uint8_t m_led_afs;
     uint8_t m_led_stem;
     uint8_t m_led_loud;
     std::vector<uint8_t> m_oled_buffer;
+    McuUiTelemetry m_telemetry;
 
     static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HardwareSimWindow* self = nullptr;
@@ -169,6 +222,20 @@ private:
                 on_lbutton_down(x, y);
                 return 0;
             }
+            case WM_RBUTTONDOWN: {
+                int x = GET_X_LPARAM(lParam);
+                int y = GET_Y_LPARAM(lParam);
+                on_rbutton_down(x, y);
+                return 0;
+            }
+            case WM_MOUSEWHEEL: {
+                short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                if (delta != 0) {
+                    std::lock_guard<std::mutex> lock(m_mtx);
+                    m_encoder_accum += (delta > 0) ? 1 : -1;
+                }
+                return 0;
+            }
             case WM_MOUSEMOVE: {
                 int x = GET_X_LPARAM(lParam);
                 int y = GET_Y_LPARAM(lParam);
@@ -191,82 +258,134 @@ private:
     void on_lbutton_down(int x, int y) {
         SetCapture(m_hWnd);
 
-        // 1. 5개 물리 페이더 드래그 (정확한 렌더링 좌표 일치: fx = 485 + ch * 92, center = fx + 33)
+        // 1. 5개 물리 페이더 드래그 (fx = 485 + ch * 92, center = fx + 33)
         for (int ch = 0; ch < 5; ++ch) {
             int fx = 485 + ch * 92;
             int slider_center_x = fx + 33;
             if (x >= slider_center_x - 25 && x <= slider_center_x + 25 && y >= 115 && y <= 385) {
-                m_dragging_fader = ch;
+                {
+                    std::lock_guard<std::mutex> lock(m_mtx);
+                    m_dragging_fader = ch;
+                }
                 update_fader_from_mouse(ch, y);
                 return;
             }
         }
 
-        // 2. 물리 택트 스위치 버튼 (AFS, STEM, LOUD)
-        // AFS 버튼 (x: 40 ~ 130, y: 250 ~ 290)
-        if (x >= 40 && x <= 130 && y >= 250 && y <= 290) {
-            m_led_afs = !m_led_afs;
-            send_control_update();
+        // 2. 물리 택트 스위치 버튼 (좌표 정확히 일치: y = 275 ~ 325)
+        // 누르는 동안 GPIO가 LOW/ACTIVE 유지되어 25ms 디바운스 및 600ms 롱프레스(AFS 리셋) 동작
+        if (x >= 40 && x <= 130 && y >= 275 && y <= 325) {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_btn_pressed[0] = true;
+            m_pressed_btn = 0;
             return;
         }
-        // STEM 버튼 (x: 150 ~ 240, y: 250 ~ 290)
-        if (x >= 150 && x <= 240 && y >= 250 && y <= 290) {
-            m_led_stem = !m_led_stem;
-            send_control_update();
+        if (x >= 150 && x <= 240 && y >= 275 && y <= 325) {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_btn_pressed[1] = true;
+            m_pressed_btn = 1;
             return;
         }
-        // LOUD 버튼 (x: 260 ~ 350, y: 250 ~ 290)
-        if (x >= 260 && x <= 350 && y >= 250 && y <= 290) {
-            m_led_loud = !m_led_loud;
-            send_control_update();
-            return;
-        }
-
-        // 3. 로터리 엔코더 버튼 (x: 375 ~ 435, y: 250 ~ 290)
-        if (x >= 375 && x <= 435 && y >= 250 && y <= 290) {
-            // 엔코더 클릭
-            ControlPacket pkt;
-            std::memset(&pkt, 0, sizeof(pkt));
-            pkt.packet_type = PKT_TYPE_CONTROL;
-            for (int i = 0; i < 5; ++i) pkt.fader_adc[i] = m_fader_adc[i];
-            pkt.encoder_delta = 1;
-            m_ipc.send_packet(HardwareIpcSocket::MIXER_PORT, &pkt, sizeof(pkt));
+        if (x >= 260 && x <= 350 && y >= 275 && y <= 325) {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_btn_pressed[2] = true;
+            m_pressed_btn = 2;
             return;
         }
 
-        // 4. CH2 Beat 음원 재생/일시정지 토글 버튼 (x: 40 ~ 230, y: 460 ~ 495)
-        if (x >= 40 && x <= 230 && y >= 460 && y <= 495) {
+        // 3. EC11 로터리 엔코더 (좌클릭: +0.5 LUFS)
+        if (x >= 375 && x <= 430 && y >= 275 && y <= 325) {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_encoder_accum += 1;
+            return;
+        }
+
+        // 4. 3-Band EQ 아날로그 노브 (cx = 100, 230, 360, cy = 359, 반경 ~22)
+        for (int k = 0; k < 3; ++k) {
+            int cx = 40 + 60 + k * 130;
+            int cy = 335 + 24;
+            if (x >= cx - 24 && x <= cx + 24 && y >= cy - 22 && y <= cy + 28) {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                m_dragging_eq = k;
+                m_eq_drag_start_y = y;
+                m_eq_drag_start_adc = m_raw_eq_adc[k];
+                return;
+            }
+        }
+
+        // 5. CH2 Beat 음원 재생/일시정지 토글 (y: 445 ~ 485)
+        if (x >= 35 && x <= 225 && y >= 445 && y <= 485) {
             m_synth.set_beat_playing(!m_synth.is_beat_playing());
             return;
         }
 
-        // 5. CH2 BPM 조절 버튼
-        if (x >= 240 && x <= 270 && y >= 460 && y <= 495) {
+        // 6. CH2 BPM 조절 버튼 ([-] 240~270, [+] 315~345, y: 445 ~ 485)
+        if (x >= 240 && x <= 270 && y >= 445 && y <= 485) {
             m_synth.set_bpm(m_synth.get_bpm() - 5.0f);
             return;
         }
-        if (x >= 310 && x <= 340 && y >= 460 && y <= 495) {
+        if (x >= 315 && x <= 345 && y >= 445 && y <= 485) {
             m_synth.set_bpm(m_synth.get_bpm() + 5.0f);
             return;
         }
 
-        // 6. CH4 Line In 2 (악기/코드) 재생/일시정지 토글 버튼 (x: 40 ~ 230, y: 520 ~ 555)
-        if (x >= 40 && x <= 230 && y >= 520 && y <= 555) {
+        // 7. CH4 Line In 2 재생/일시정지 토글 (x: 35 ~ 225, y: 500 ~ 540)
+        if (x >= 35 && x <= 225 && y >= 500 && y <= 540) {
             m_synth.set_line2_playing(!m_synth.is_line2_playing());
             return;
         }
     }
 
+    void on_rbutton_down(int x, int y) {
+        // 엔코더 우클릭: -0.5 LUFS
+        if (x >= 375 && x <= 430 && y >= 275 && y <= 325) {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_encoder_accum -= 1;
+            return;
+        }
+        // EQ 노브 우클릭: 0.0 dB 센터 리셋
+        for (int k = 0; k < 3; ++k) {
+            int cx = 40 + 60 + k * 130;
+            int cy = 335 + 24;
+            if (x >= cx - 24 && x <= cx + 24 && y >= cy - 22 && y <= cy + 28) {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                m_raw_eq_adc[k] = 512;
+                return;
+            }
+        }
+    }
+
     void on_mouse_move(int x, int y) {
-        if (m_dragging_fader >= 0) {
-            update_fader_from_mouse(m_dragging_fader, y);
+        (void)x;
+        int drag_fader = -1;
+        int drag_eq = -1;
+        int eq_start_y = 0;
+        int eq_start_adc = 512;
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            drag_fader = m_dragging_fader;
+            drag_eq = m_dragging_eq;
+            eq_start_y = m_eq_drag_start_y;
+            eq_start_adc = m_eq_drag_start_adc;
+        }
+        if (drag_fader >= 0) {
+            update_fader_from_mouse(drag_fader, y);
+        } else if (drag_eq >= 0) {
+            int delta_y = eq_start_y - y;
+            int next_adc = std::clamp(eq_start_adc + delta_y * 6, 0, 1023);
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_raw_eq_adc[drag_eq] = next_adc;
         }
     }
 
     void on_lbutton_up() {
-        if (m_dragging_fader >= 0) {
-            m_dragging_fader = -1;
-            send_control_update();
+        std::lock_guard<std::mutex> lock(m_mtx);
+        bool had_capture = (m_dragging_fader >= 0 || m_dragging_eq >= 0 || m_pressed_btn >= 0);
+        m_dragging_fader = -1;
+        m_dragging_eq = -1;
+        m_pressed_btn = -1;
+        m_btn_pressed.fill(false);
+        if (had_capture || GetCapture() == m_hWnd) {
             ReleaseCapture();
         }
     }
@@ -276,11 +395,30 @@ private:
         constexpr int bottom = 365;
         float norm = 1.0f - static_cast<float>(y - top) / (bottom - top);
         norm = std::clamp(norm, 0.0f, 1.0f);
-        m_fader_adc[ch] = static_cast<int>(norm * 1023);
-        send_control_update();
+        std::lock_guard<std::mutex> lock(m_mtx);
+        m_raw_fader_adc[ch] = static_cast<int>(norm * 1023);
+        m_display_fader_adc[ch] = m_raw_fader_adc[ch];
     }
 
     void render(HDC hdc) {
+        std::array<int, 5> fader_adc_snap;
+        std::array<int, 3> eq_adc_snap;
+        std::vector<uint8_t> oled_snap;
+        McuUiTelemetry tel_snap;
+        uint8_t led_a, led_s, led_l;
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            for (int i = 0; i < 5; ++i) {
+                fader_adc_snap[i] = (m_dragging_fader == i) ? m_raw_fader_adc[i] : m_display_fader_adc[i];
+            }
+            eq_adc_snap = m_raw_eq_adc;
+            oled_snap = m_oled_buffer;
+            tel_snap = m_telemetry;
+            led_a = m_led_afs;
+            led_s = m_led_stem;
+            led_l = m_led_loud;
+        }
+
         RECT client_rc;
         GetClientRect(m_hWnd, &client_rc);
         int w = client_rc.right;
@@ -298,19 +436,19 @@ private:
         SetBkMode(memDC, TRANSPARENT);
 
         // 상단 헤더
-        draw_header(memDC, w);
+        draw_header(memDC, w, tel_snap);
 
         // 좌측 상단: 0.96인치 128x64 OLED 디스플레이 모듈 시뮬레이터
-        draw_oled_screen(memDC);
+        draw_oled_screen(memDC, oled_snap, tel_snap);
 
-        // 좌측 중단: 물리 택트 버튼 & LED 링 & 로터리 엔코더
-        draw_physical_controls(memDC);
+        // 좌측 중단: 물리 택트 버튼 & LED 링 & 로터리 엔코더 & EQ 노브
+        draw_physical_controls(memDC, led_a != 0, led_s != 0, led_l != 0, eq_adc_snap, tel_snap);
 
         // 좌측 하단: 하드웨어 음원 생성기 (CH2 비트 & CH4 라인 2)
         draw_audio_sources_card(memDC);
 
         // 우측: 5개 물리 슬라이드 페이더 (PTA 10k 슬라이더)
-        draw_physical_faders(memDC);
+        draw_physical_faders(memDC, fader_adc_snap);
 
         BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
 
@@ -319,7 +457,7 @@ private:
         DeleteDC(memDC);
     }
 
-    void draw_header(HDC hdc, int w) {
+    void draw_header(HDC hdc, int w, const McuUiTelemetry& tel) {
         RECT rc = { 0, 0, w, 48 };
         HBRUSH hBr = CreateSolidBrush(RGB(18, 19, 22));
         FillRect(hdc, &rc, hBr);
@@ -336,11 +474,14 @@ private:
         HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, hTitleFont));
 
         SetTextColor(hdc, RGB(240, 242, 245));
-        TextOutW(hdc, 20, 12, L"🎛️ STM32H743 PHYSICAL HARDWARE SIMULATOR", 41);
+        TextOutW(hdc, 20, 12, L"🎛️ STM32H743 FIRMWARE SIMULATOR (155KB SRAM)", 46);
 
-        // 통신 연결 뱃지
-        SetTextColor(hdc, RGB(57, 255, 20));
-        TextOutW(hdc, w - 370, 14, L"● IPC LINKED (127.0.0.1:9123 / UDP 0.05ms)", 43);
+        // 통신 연결 및 온보드 펌웨어 활성 뱃지
+        SetTextColor(hdc, tel.pc_host_linked ? RGB(57, 255, 20) : RGB(0, 210, 255));
+        const wchar_t* badge = tel.pc_host_linked
+            ? L"● MCU DSP ACTIVE | PC HOST LINKED (UDP)"
+            : L"● MCU DSP ACTIVE | STANDALONE HW MODE";
+        TextOutW(hdc, w - 340, 14, badge, static_cast<int>(wcslen(badge)));
 
         SelectObject(hdc, oldFont);
         SelectObject(hdc, oldPen);
@@ -348,17 +489,17 @@ private:
         DeleteObject(hTitleFont);
     }
 
-    void draw_oled_screen(HDC hdc) {
+    void draw_oled_screen(HDC hdc, const std::vector<uint8_t>& oled_snap, const McuUiTelemetry& tel) {
         RECT panelRc = { 20, 60, 440, 230 };
-        draw_module_card(hdc, panelRc, L"0.96\" OLED DISPLAY (SSD1306 128x64)");
+        draw_module_card(hdc, panelRc, L"0.96\" OLED DISPLAY (STM32 SSD1306 128x64)");
 
-        // OLED 유리 영역 (x: 40, y: 92, w: 256, h: 128 -> 2배 확대 픽셀)
+        // OLED 유리 영역
         RECT screenRc = { 35, 90, 425, 218 };
         HBRUSH oledBg = CreateSolidBrush(RGB(6, 8, 12));
         FillRect(hdc, &screenRc, oledBg);
         DeleteObject(oledBg);
 
-        HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(0, 180, 230));
+        HPEN borderPen = CreatePen(PS_SOLID, 1, tel.howling_alert ? RGB(255, 80, 80) : RGB(0, 180, 230));
         HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, borderPen));
         MoveToEx(hdc, screenRc.left - 1, screenRc.top - 1, nullptr);
         LineTo(hdc, screenRc.right + 1, screenRc.top - 1);
@@ -368,11 +509,11 @@ private:
         SelectObject(hdc, oldPen);
         DeleteObject(borderPen);
 
-        // 128x64 프레임버퍼 픽셀 렌더링 (2배 스케일: 가로 3px, 세로 2px)
-        HBRUSH pixelBrush = CreateSolidBrush(RGB(0, 220, 255)); // Amber/Cyan OLED
+        // 128x64 프레임버퍼 픽셀 렌더링
+        HBRUSH pixelBrush = CreateSolidBrush(RGB(0, 220, 255));
         for (int page = 0; page < 8; ++page) {
             for (int col = 0; col < 128; ++col) {
-                uint8_t b = m_oled_buffer[page * 128 + col];
+                uint8_t b = oled_snap[page * 128 + col];
                 if (b == 0) continue;
                 for (int bit = 0; bit < 8; ++bit) {
                     if (b & (1 << bit)) {
@@ -387,26 +528,41 @@ private:
             }
         }
         DeleteObject(pixelBrush);
+
+        // OLED 보조 Telemetry 오버레이 (MCU 상태 수치)
+        HFONT hFont = CreateFontW(11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH, L"Consolas");
+        HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, hFont));
+        SetTextColor(hdc, tel.howling_alert ? RGB(255, 100, 100) : RGB(170, 230, 255));
+        wchar_t info[96];
+        swprintf_s(info, L"NOTCH:%u  LUFS:%.1f (TGT:%.1f)",
+                   static_cast<unsigned>(tel.active_notches),
+                   tel.measured_lufs, tel.target_lufs);
+        TextOutW(hdc, screenRc.left + 135, screenRc.top + 3, info, static_cast<int>(wcslen(info)));
+        SelectObject(hdc, oldFont);
+        DeleteObject(hFont);
     }
 
-    void draw_physical_controls(HDC hdc) {
+    void draw_physical_controls(HDC hdc, bool led_afs, bool led_stem, bool led_loud,
+                                const std::array<int, 3>& eq_adc, const McuUiTelemetry& tel) {
         RECT panelRc = { 20, 240, 440, 395 };
-        draw_module_card(hdc, panelRc, L"TACT SWITCHES, LEDS & EC11 ENCODER (H-FR-6, 7)");
+        draw_module_card(hdc, panelRc, L"TACT SWITCHES (25ms DEB), EC11 & EQ KNOBS");
 
-        // 1. AFS 택트 스위치 & LED
-        draw_tact_button(hdc, 40, 275, 130, 325, L"AFS", m_led_afs, RGB(57, 255, 20));
+        // 1. AFS 택트 스위치 & LED (600ms 홀드 시 노치 리셋)
+        draw_tact_button(hdc, 40, 275, 130, 325, L"AFS (HOLD=RST)", led_afs, RGB(57, 255, 20));
 
         // 2. STEM 택트 스위치 & LED
-        draw_tact_button(hdc, 150, 275, 240, 325, L"STEM", m_led_stem, RGB(0, 210, 255));
+        draw_tact_button(hdc, 150, 275, 240, 325, L"STEM", led_stem, RGB(0, 210, 255));
 
         // 3. LOUD 택트 스위치 & LED
-        draw_tact_button(hdc, 260, 275, 350, 325, L"LOUD", m_led_loud, RGB(255, 187, 0));
+        draw_tact_button(hdc, 260, 275, 350, 325, L"LOUD", led_loud, RGB(255, 187, 0));
 
-        // 4. EC11 무한 로터리 엔코더 (푸시 스위치 내장)
+        // 4. EC11 무한 로터리 엔코더 (좌:+ / 우:- / 휠)
         draw_rotary_encoder(hdc, 375, 275, 430, 325);
 
         // 5. EQ 아날로그 가변저항 노브 (Low, Mid, High)
-        draw_eq_knobs(hdc, 40, 335);
+        draw_eq_knobs(hdc, 40, 335, eq_adc, tel);
     }
 
     void draw_tact_button(HDC hdc, int x0, int y0, int x1, int y1, const wchar_t* label, bool led_on, COLORREF led_color) {
@@ -466,7 +622,8 @@ private:
         DeleteObject(hFont);
     }
 
-    void draw_eq_knobs(HDC hdc, int start_x, int y0) {
+    void draw_eq_knobs(HDC hdc, int start_x, int y0, const std::array<int, 3>& eq_adc, const McuUiTelemetry& tel) {
+        (void)eq_adc;
         const wchar_t* eq_labels[] = { L"EQ LOW", L"EQ MID", L"EQ HIGH" };
         HFONT hFont = CreateFontW(11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -486,17 +643,24 @@ private:
             DeleteObject(knobBr);
             DeleteObject(knobPen);
 
-            // 포인터 라인 (12시 방향 센터)
+            // 포인터 라인 (-12dB = -135 deg, 0dB = 0 deg top, +12dB = +135 deg)
+            float db = tel.eq_db[k];
+            float angle_rad = (db / 12.0f) * (135.0f * 3.14159265f / 180.0f);
+            int px = cx + static_cast<int>(std::sin(angle_rad) * 13.0f);
+            int py = cy - static_cast<int>(std::cos(angle_rad) * 13.0f);
+
             HPEN ptrPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
             SelectObject(hdc, ptrPen);
             MoveToEx(hdc, cx, cy, nullptr);
-            LineTo(hdc, cx, cy - 13);
+            LineTo(hdc, px, py);
             DeleteObject(ptrPen);
 
-            // 라벨
+            // 라벨 + dB 수치
+            wchar_t lbl[40];
+            swprintf_s(lbl, L"%s (%+.1fdB)", eq_labels[k], db);
             SetTextColor(hdc, RGB(180, 185, 195));
-            RECT lblRc = { cx - 50, cy + 18, cx + 50, cy + 34 };
-            DrawTextW(hdc, eq_labels[k], -1, &lblRc, DT_CENTER | DT_SINGLELINE);
+            RECT lblRc = { cx - 58, cy + 18, cx + 58, cy + 34 };
+            DrawTextW(hdc, lbl, -1, &lblRc, DT_CENTER | DT_SINGLELINE);
         }
 
         SelectObject(hdc, oldFont);
@@ -553,13 +717,13 @@ private:
         // 오디오 라우팅 설명
         RECT infoRc = { 35, 555, 425, 585 };
         SetTextColor(hdc, RGB(57, 255, 20));
-        DrawTextW(hdc, L"● Live Audio Stream -> Main Mixer CH 2 & CH 4 over UDP", -1, &infoRc, DT_LEFT);
+        DrawTextW(hdc, L"● Onboard STM32 DSP: AFS, 3-Band EQ, Mixer, LUFS & OLED", -1, &infoRc, DT_LEFT);
 
         SelectObject(hdc, oldFont);
         DeleteObject(hFont);
     }
 
-    void draw_physical_faders(HDC hdc) {
+    void draw_physical_faders(HDC hdc, const std::array<int, 5>& fader_adc) {
         RECT panelRc = { 460, 60, 935, 595 };
         draw_module_card(hdc, panelRc, L"5-CHANNEL PHYSICAL SLIDE FADERS (PTA 10K LINEAR)");
 
@@ -606,7 +770,7 @@ private:
             DeleteObject(slotBr);
 
             // 페이더 노브 (실제 믹서 금속 손잡이 형태)
-            float norm = m_fader_adc[i] / 1023.0f;
+            float norm = fader_adc[i] / 1023.0f;
             int thumb_y = static_cast<int>(365 - norm * (365 - 125));
 
             RECT thumbRc = { fx + 18, thumb_y - 10, fx + 48, thumb_y + 10 };
@@ -629,7 +793,7 @@ private:
             SelectObject(hdc, hAdcFont);
             SetTextColor(hdc, RGB(240, 245, 255));
             wchar_t adcBuf[32];
-            swprintf_s(adcBuf, L"%d", m_fader_adc[i]);
+            swprintf_s(adcBuf, L"%d", fader_adc[i]);
             RECT adcRc = { fx - 10, 385, fx + 75, 405 };
             DrawTextW(hdc, adcBuf, -1, &adcRc, DT_CENTER | DT_SINGLELINE);
 

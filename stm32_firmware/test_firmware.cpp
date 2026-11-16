@@ -163,6 +163,45 @@ void test_host_vcp_rx_sync() {
     std::cout << " PASSED\n";
 }
 
+void test_multitrack_hil_simulator_block() {
+    std::cout << "[MCU Test 6] HIL Multitrack Block (Mic+Beat+Line2 + HTDemucs + VU)...";
+    static Stm32MixerFirmware fw;
+    g_mock_vcp_tx.clear();
+    g_mock_tick_ms = 200;
+    fw.init(make_mock_cb());
+
+    std::vector<int16_t> mic(512 * 2, 0);
+    std::vector<int16_t> vocal(512 * 2, 0);
+    std::vector<int16_t> beat(512 * 2, 0);
+    std::vector<int16_t> inst(512 * 2, 0);
+    std::vector<int16_t> dac_out(512 * 2, 0);
+
+    constexpr float PI = 3.14159265358979323846f;
+    for (int blk = 0; blk < 10; ++blk) {
+        for (size_t i = 0; i < 512; ++i) {
+            size_t sidx = blk * 512 + i;
+            float m = 0.65f * std::sin(2.0f * PI * 2500.0f * sidx / 44100.0f);
+            float v = 0.25f * std::sin(2.0f * PI * 440.0f * sidx / 44100.0f);
+            float b = 0.20f * std::sin(2.0f * PI * 100.0f * sidx / 44100.0f);
+            float n = 0.15f * std::sin(2.0f * PI * 330.0f * sidx / 44100.0f);
+            mic[i * 2] = mic[i * 2 + 1] = static_cast<int16_t>(m * 32767.0f);
+            vocal[i * 2] = vocal[i * 2 + 1] = static_cast<int16_t>(v * 32767.0f);
+            beat[i * 2] = beat[i * 2 + 1] = static_cast<int16_t>(b * 32767.0f);
+            inst[i * 2] = inst[i * 2 + 1] = static_cast<int16_t>(n * 32767.0f);
+        }
+        g_mock_tick_ms += 12;
+        fw.process_multitrack_audio_block(mic.data(), vocal.data(), beat.data(), inst.data(), dac_out.data(), 512, true);
+    }
+
+    assert(fw.get_afs().get_active_filter_count() >= 1);
+    assert(fw.get_vu_level(1) > 0.05f);
+    assert(fw.get_vu_level(2) > 0.05f);
+    assert(fw.get_vu_level(4) > 0.03f);
+    fw.on_ui_tick();
+    assert(fw.is_howling_alert() == true);
+    std::cout << " PASSED\n";
+}
+
 int main() {
     std::cout << "\n=== Running STM32 Hardware Firmware Verification ===\n";
     test_static_sram_footprint();
@@ -170,7 +209,8 @@ int main() {
     test_button_debouncer_and_encoder();
     test_onboard_afs_howling_and_oled();
     test_host_vcp_rx_sync();
-    std::cout << "=== All 5 MCU Firmware Tests Passed Successfully! ===\n\n";
+    test_multitrack_hil_simulator_block();
+    std::cout << "=== All 6 MCU Firmware Tests Passed Successfully! ===\n\n";
     return 0;
 }
 

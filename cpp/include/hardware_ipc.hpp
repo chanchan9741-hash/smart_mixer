@@ -17,10 +17,13 @@ namespace SmartMixer {
 
 // 패킷 타입 ID
 enum PacketType : uint8_t {
-    PKT_TYPE_CONTROL = 0x01,       // 페이더, 버튼, 엔코더 상태 (하드웨어 -> 메인 믹서)
-    PKT_TYPE_AUDIO_BEAT = 0x02,    // 비트/드럼 채널 오디오 블록 (하드웨어 -> 메인 믹서 CH 2)
-    PKT_TYPE_AUDIO_LINE2 = 0x03,   // 라인 2/악기 채널 오디오 블록 (하드웨어 -> 메인 믹서 CH 4)
-    PKT_TYPE_FEEDBACK = 0x04       // OLED 화면(1024B) & LED 상태 (메인 믹서 -> 하드웨어)
+    PKT_TYPE_CONTROL = 0x01,          // 페이더, 버튼, 엔코더 상태 (하드웨어 -> 메인 믹서)
+    PKT_TYPE_AUDIO_BEAT = 0x02,       // 비트/드럼 채널 오디오 블록 (하드웨어 -> 메인 믹서 CH 2)
+    PKT_TYPE_AUDIO_LINE2 = 0x03,      // 라인 2/악기 채널 오디오 블록 (하드웨어 -> 메인 믹서 CH 4)
+    PKT_TYPE_FEEDBACK = 0x04,         // OLED 화면(1024B) & LED 상태 (메인 믹서 -> 하드웨어)
+    PKT_TYPE_HOST_AUDIO_BLOCK = 0x05, // PC 호스트 -> 하드웨어 시뮬레이터 (WASAPI Mic + AI 스템 입력)
+    PKT_TYPE_HW_MIXED_AUDIO = 0x06,   // 하드웨어 시뮬레이터(STM32 DSP) -> PC 호스트 (최종 믹스 & 텔레메트리)
+    PKT_TYPE_VCP_COMMAND = 0x07       // 양방향 STM32 USB VCP ASCII 명령 라인 터널링
 };
 
 // 제어 신호 패킷 구조체
@@ -53,6 +56,42 @@ struct FeedbackPacket {
     uint16_t fader_adc[5];         // 5채널 슬라이더 ADC (0 ~ 1023) - 소프트웨어 -> 하드웨어 동기화
     int8_t active_channel;         // 메인 믹서 GUI에서 드래그 중인 채널 (-1: 없음, 0~4)
     uint8_t oled_framebuffer[1024];// 128x64 픽셀 모노크롬 (SSD1306)
+};
+
+// PC 호스트 -> STM32 하드웨어 시뮬레이터 오디오 입력 블록 (512 프레임 스테레오 int16 PCM)
+struct HostAudioBlockPacket {
+    uint8_t packet_type;           // PKT_TYPE_HOST_AUDIO_BLOCK
+    uint8_t use_external_stems;    // 1: HTDemucs AI 스템(vocal/beat/inst) 사용, 0: HW 시뮬레이터 자체 비트/라인2 사용
+    uint16_t num_frames;           // 512
+    int16_t mic_i16[1024];         // CH3: PC WASAPI 마이크(또는 가상 보컬+하울링 주입)
+    int16_t vocal_i16[1024];       // CH1: HTDemucs Vocal
+    int16_t beat_i16[1024];        // CH2: HTDemucs Beat (use_external_stems == 1)
+    int16_t inst_i16[1024];        // CH4: HTDemucs Inst (use_external_stems == 1)
+};
+
+// STM32 하드웨어 시뮬레이터 -> PC 호스트 최종 DSP 처리 출력 + 텔레메트리
+struct HwMixedAudioPacket {
+    uint8_t packet_type;           // PKT_TYPE_HW_MIXED_AUDIO
+    uint16_t num_frames;           // 512
+    uint8_t led_afs;
+    uint8_t led_stem;
+    uint8_t led_loud;
+    uint8_t active_notches;
+    uint32_t suppressed_count;
+    float measured_lufs;
+    float target_lufs;
+    float auto_gain_db;
+    float vu_levels[5];
+    float spectrum_bars[16];
+    uint16_t fader_adc[5];
+    int16_t mixed_out_i16[1024];   // STM32 AFS+Mixer+EQ+Loudness 통과 완료 스테레오 PCM
+};
+
+// STM32 USB VCP ASCII 명령 패킷 (양방향 시리얼 터널링)
+struct VcpCommandPacket {
+    uint8_t packet_type;           // PKT_TYPE_VCP_COMMAND
+    uint16_t len;
+    char text[96];
 };
 
 #pragma pack(pop)

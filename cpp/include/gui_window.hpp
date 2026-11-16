@@ -141,6 +141,14 @@ public:
         m_active_device_name = name;
     }
 
+    void set_hw_dsp_telemetry(bool hw_active, uint8_t notches, uint32_t suppressed, float measured_lufs, float gain_db) {
+        m_hw_dsp_active.store(hw_active);
+        m_hw_notches.store(notches);
+        m_hw_suppressed.store(suppressed);
+        m_hw_measured_lufs.store(measured_lufs);
+        m_hw_gain_db.store(gain_db);
+    }
+
     bool create(int width = 1060, int height = 690) {
         INITCOMMONCONTROLSEX icex;
         icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
@@ -253,6 +261,11 @@ private:
     AISeparateCallback m_ai_separate_callback;
     std::atomic<bool> m_is_ai_busy{false};
     std::atomic<int> m_ai_progress{0};
+    std::atomic<bool> m_hw_dsp_active{false};
+    std::atomic<uint8_t> m_hw_notches{0};
+    std::atomic<uint32_t> m_hw_suppressed{0};
+    std::atomic<float> m_hw_measured_lufs{-70.0f};
+    std::atomic<float> m_hw_gain_db{0.0f};
     std::wstring m_active_device_name;
     std::wstring m_active_output_name;
 
@@ -635,9 +648,16 @@ private:
         SetTextColor(hdc, RGB(57, 255, 20));
         TextOutW(hdc, 552, 17, L"🔊 출력:", 5);
 
-        // FPS 수치
-        SetTextColor(hdc, RGB(160, 165, 175));
-        TextOutW(hdc, w - 125, 17, L"60 FPS (PR-3)", 13);
+        // HW DSP 링크 & FPS 수치
+        if (m_hw_dsp_active.load()) {
+            SetTextColor(hdc, RGB(57, 255, 20));
+            TextOutW(hdc, w - 132, 10, L"● HW: STM32 DSP", 15);
+            SetTextColor(hdc, RGB(160, 165, 175));
+            TextOutW(hdc, w - 132, 27, L"60 FPS (PR-3)", 13);
+        } else {
+            SetTextColor(hdc, RGB(160, 165, 175));
+            TextOutW(hdc, w - 125, 17, L"60 FPS (PR-3)", 13);
+        }
 
         SelectObject(hdc, oldFont);
         SelectObject(hdc, oldPen);
@@ -864,9 +884,11 @@ private:
         SetTextColor(hdc, RGB(170, 175, 185));
 
         wchar_t afsInfo[128];
-        swprintf_s(afsInfo, L"Active Notches: %d / 8\nSuppressed Events: %d",
-                   static_cast<int>(m_afs.get_active_filter_count()),
-                   m_afs.get_suppressed_count());
+        bool use_hw_tel = m_hw_dsp_active.load();
+        int notches_disp = use_hw_tel ? static_cast<int>(m_hw_notches.load()) : static_cast<int>(m_afs.get_active_filter_count());
+        unsigned supp_disp = use_hw_tel ? static_cast<unsigned>(m_hw_suppressed.load()) : static_cast<unsigned>(m_afs.get_suppressed_count());
+        swprintf_s(afsInfo, L"Active Notches: %d / 8\nSuppressed Events: %u",
+                   notches_disp, supp_disp);
         RECT afsTxtRc = { 510, 456, 660, 494 };
         DrawTextW(hdc, afsInfo, -1, &afsTxtRc, DT_LEFT);
 
@@ -892,9 +914,10 @@ private:
         draw_toggle_button(hdc, 690, 412, 844, 446, L"LOUD ACTIVE", loud_on, RGB(0, 104, 71), RGB(57, 255, 20));
 
         wchar_t loudInfo[128];
+        float meas_lufs_disp = use_hw_tel ? m_hw_measured_lufs.load() : m_loudness.get_measured_lufs();
+        float gain_db_disp = use_hw_tel ? m_hw_gain_db.load() : m_loudness.get_current_gain_db();
         swprintf_s(loudInfo, L"Measured: %.1f LUFS\nAuto Gain: %+.1f dB",
-                   m_loudness.get_measured_lufs(),
-                   m_loudness.get_current_gain_db());
+                   meas_lufs_disp, gain_db_disp);
         RECT loudTxtRc = { 694, 456, 844, 494 };
         DrawTextW(hdc, loudInfo, -1, &loudTxtRc, DT_LEFT);
 
